@@ -6,6 +6,7 @@ from io import BytesIO
 from beets import config
 from beets.plugins import BeetsPlugin as beetsplugin
 from beets.ui import Subcommand as subcommand
+from pathvalidate import sanitize_filename
 
 if 'beetfs' in config:
     PATH_FORMAT = config['beetfs']['path_format'].get().split('/')
@@ -235,7 +236,7 @@ class Operations(pyfuse3.Operations):
         for item in items:
             cursor = root
             for depth in range(0, height):
-                name = item.evaluate_template(PATH_FORMAT[depth])
+                name = sanitize_filename(item.evaluate_template(PATH_FORMAT[depth]))
                 if depth == height - 1: # file
                     name += os.path.splitext(item.path)[-1].decode('utf-8') # add extension
                     beet_id = item.id
