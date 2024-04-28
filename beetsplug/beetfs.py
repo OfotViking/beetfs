@@ -195,8 +195,8 @@ class TreeNode():
         self.children = []
         self.header = None
         self.item_type = self.find_type()
-        self.data_start = self.find_mp3_data_start() if self.item_type == 'audip/mp3' else self.find_flac_data_start() # where audio frame data starts in original file
-        _header = self.create_mp3_header() if self.item_type == 'audip/mp3' else self.create_flac_header()
+        self.data_start = self.find_mp3_data_start() if self.item_type == 'audio/mpeg' else self.find_flac_data_start() # where audio frame data starts in original file
+        _header = self.create_mp3_header() if self.item_type == 'audio/mpeg' else self.create_flac_header()
         self.header_len = False if not _header else len(_header)
         if self.beet_item:
             self.size = self.header_len + os.path.getsize(self.beet_item.path) - self.data_start
@@ -302,7 +302,7 @@ class Operations(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EACCES)
         item = self.tree.find('inode', inode)
         BEET_LOG.debug('open: item_type={}'.format(item.item_type))
-        item.header = item.create_mp3_header() if item.item_type == 'mp3' else item.create_flac_header()
+        item.header = item.create_mp3_header() if item.item_type == 'audio/mpeg' else item.create_flac_header()
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size):
