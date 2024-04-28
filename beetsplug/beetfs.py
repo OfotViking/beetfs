@@ -1,4 +1,4 @@
-import os, stat, errno, datetime, pyfuse3, trio, logging
+import os, stat, errno, datetime, pyfuse3, trio, logging, mimetypes
 from mutagen.easyid3 import EasyID3
 from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
@@ -97,15 +97,13 @@ def get_id3_key(beet_key):
         return None
 
 class TreeNode():
-    def guess_type(self):
+    def find_type(self):
         if self.beet_item == None:
             return False
         path = self.beet_item.path
-        f = open(path, 'rb')
-        # TODO: don't read the entire file (multiple times!) here
-        mp3_score = MP3.score(path, f, f.read())
-        flac_score = FLAC.score(path, f, f.read())
-        return 'flac' if flac_score > mp3_score else 'mp3'
+        filetype = mimetypes.guess_type(os.fsdecode(path))[0]
+        BEET_LOG.debug("Filetype is " + str(filetype))
+        return filetype
 
     def find_mp3_data_start(self):
         if self.beet_item == None: # dir
@@ -196,9 +194,9 @@ class TreeNode():
         self.parent = parent
         self.children = []
         self.header = None
-        self.item_type = self.guess_type()
-        self.data_start = self.find_mp3_data_start() if self.item_type == 'mp3' else self.find_flac_data_start() # where audio frame data starts in original file
-        _header = self.create_mp3_header() if self.item_type == 'mp3' else self.create_flac_header()
+        self.item_type = self.find_type()
+        self.data_start = self.find_mp3_data_start() if self.item_type == 'audip/mp3' else self.find_flac_data_start() # where audio frame data starts in original file
+        _header = self.create_mp3_header() if self.item_type == 'audip/mp3' else self.create_flac_header()
         self.header_len = False if not _header else len(_header)
         if self.beet_item:
             self.size = self.header_len + os.path.getsize(self.beet_item.path) - self.data_start
