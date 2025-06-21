@@ -236,23 +236,33 @@ class TreeNode():
                 sections[block_header_type & 127] = bfile.read(length)
                 cursor += 4 + length
                 done = block_header_type & 128 != 0
+        
+        # Build vorbis comment with proper field count
         vorbis_comment = b''
-        field_len = 0
+        field_count = 0
         for item in self.beet_item.items():
             if item[1]:
-                field_len += 1
+                field_count += 1
                 line = bytes(item[0].upper() + '=' + str(item[1]), 'utf-8')
                 line = len(line).to_bytes(4, 'little') + line
                 vorbis_comment += line
-        vorbis_comment = len(vorbis_comment).to_bytes(4, 'little') + vorbis_comment
+        
+        # Prepend field count and vendor string
+        vorbis_comment = field_count.to_bytes(4, 'little') + vorbis_comment
         vorbis_comment = b'\x05\x00\x00\x00beets' + vorbis_comment # 'beets' vendor string
         sections[4] = vorbis_comment # VORBIS_COMMENT
+        
+        # Build header, ensuring proper last-block flags
         header = b'fLaC' # beginning of flac header
-        for section in sorted(list(sections.keys())): # sort to get STREAMINFO first
-            if section == 1: # padding
-                continue
-            header += section.to_bytes(1, 'big') + len(sections[section]).to_bytes(3, 'big')
+        sorted_sections = sorted([s for s in sections.keys() if s != 1])  # exclude padding
+        
+        for i, section in enumerate(sorted_sections):
+            is_last = (i == len(sorted_sections) - 1)  # last non-padding block
+            block_type = section | (0x80 if is_last else 0x00)  # set last-block flag only for last block
+            header += block_type.to_bytes(1, 'big') + len(sections[section]).to_bytes(3, 'big')
             header += bytes(sections[section])
+        
+        # Add padding as the final block with last-block flag
         header += b'\x81' + FLAC_PADDING.to_bytes(3, 'big')
         header += b'\x00' * FLAC_PADDING
         return header
