@@ -2,6 +2,7 @@ import os, stat, errno, datetime, pyfuse3, trio, logging, mimetypes
 from mutagen.easyid3 import EasyID3
 from mutagen.flac import FLAC
 from mutagen.mp3 import MP3
+from mutagen.id3 import ID3, APIC
 from io import BytesIO
 from beets import config
 from beets.plugins import BeetsPlugin as beetsplugin
@@ -107,6 +108,77 @@ class TreeNode():
         BEET_LOG.debug("Filetype is " + str(filetype))
         return filetype
 
+    def extract_album_art(self):
+        """Extract album art from existing cover files or embedded in audio files"""
+        if self.beet_id != -1:  # this is a file, not a directory
+            return None
+        
+        # First, try to find existing cover art files in the source directory
+        # Get the source directory from the first audio file
+        source_dir = None
+        for child in self.children:
+            if child.beet_item:
+                # Handle both string and bytes paths
+                item_path = child.beet_item.path
+                if isinstance(item_path, bytes):
+                    item_path = os.fsdecode(item_path)
+                source_dir = os.path.dirname(item_path)
+                break
+        
+        if source_dir:
+            # Common cover art file names
+            cover_names = ['cover.jpg', 'cover.jpeg', 'cover.png', 'folder.jpg', 'folder.jpeg', 'folder.png',
+                          'front.jpg', 'front.jpeg', 'front.png', 'album.jpg', 'album.jpeg', 'album.png']
+            
+            for cover_name in cover_names:
+                cover_path = os.path.join(source_dir, cover_name)
+                if os.path.exists(cover_path):
+                    try:
+                        with open(cover_path, 'rb') as cover_file:
+                            cover_data = cover_file.read()
+                            # Determine extension from file
+                            _, ext = os.path.splitext(cover_name)
+                            mime_type = 'image/jpeg' if ext.lower() in ['.jpg', '.jpeg'] else 'image/png'
+                            BEET_LOG.debug(f"Found cover art file: {cover_path}")
+                            return {
+                                'data': cover_data,
+                                'mime': mime_type,
+                                'ext': ext.lower()
+                            }
+                    except Exception as e:
+                        BEET_LOG.debug(f"Error reading cover file {cover_path}: {e}")
+                        continue
+            
+        # If no external cover file found, try embedded album art
+        for child in self.children:
+            if child.beet_item and child.item_type in ['audio/mpeg', 'audio/flac']:
+                try:
+                    if child.item_type == 'audio/mpeg':
+                        audio_file = MP3(child.beet_item.path)
+                        if audio_file.tags:
+                            for tag in audio_file.tags.values():
+                                if isinstance(tag, APIC):
+                                    BEET_LOG.debug(f"Found embedded album art in MP3: {child.beet_item.path}")
+                                    return {
+                                        'data': tag.data,
+                                        'mime': tag.mime,
+                                        'ext': '.jpg' if 'jpeg' in tag.mime.lower() else '.png'
+                                    }
+                    elif child.item_type == 'audio/flac':
+                        audio_file = FLAC(child.beet_item.path)
+                        if audio_file.pictures:
+                            pic = audio_file.pictures[0]
+                            BEET_LOG.debug(f"Found embedded album art in FLAC: {child.beet_item.path}")
+                            return {
+                                'data': pic.data,
+                                'mime': pic.mime,
+                                'ext': '.jpg' if 'jpeg' in pic.mime.lower() else '.png'
+                            }
+                except Exception as e:
+                    BEET_LOG.debug(f"Error extracting album art from {child.beet_item.path}: {e}")
+                    continue
+        return None
+
     def find_mp3_data_start(self):
         if self.beet_item == None: # dir
             return False
@@ -185,23 +257,32 @@ class TreeNode():
         header += b'\x00' * FLAC_PADDING
         return header
 
-    def __init__(self, name='', inode=1, beet_id=-1, mount_path='', parent=None):
+    def __init__(self, name='', inode=1, beet_id=-1, mount_path='', parent=None, is_album_art=False):
         BEET_LOG.debug("Creating node " + str(name))
         self.name = name
         self.inode = inode
         self.beet_id = beet_id
-        _beet_item = library.get_item(self.beet_id)
+        _beet_item = library.get_item(self.beet_id) if not is_album_art else None
         self.beet_item = None if not _beet_item else _beet_item
         self.mount_path = mount_path
         self.parent = parent
         self.children = []
         self.header = None
-        self.item_type = self.find_type()
-        self.data_start = self.find_mp3_data_start() if self.item_type == 'audio/mpeg' else self.find_flac_data_start() # where audio frame data starts in original file
-        _header = self.create_mp3_header() if self.item_type == 'audio/mpeg' else self.create_flac_header()
-        self.header_len = False if not _header else len(_header)
-        if self.beet_item:
-            self.size = self.header_len + os.path.getsize(self.beet_item.path) - self.data_start
+        self.is_album_art = is_album_art
+        self.album_art_data = None
+        
+        if not is_album_art:
+            self.item_type = self.find_type()
+            self.data_start = self.find_mp3_data_start() if self.item_type == 'audio/mpeg' else self.find_flac_data_start() # where audio frame data starts in original file
+            _header = self.create_mp3_header() if self.item_type == 'audio/mpeg' else self.create_flac_header()
+            self.header_len = False if not _header else len(_header)
+            if self.beet_item:
+                self.size = self.header_len + os.path.getsize(self.beet_item.path) - self.data_start
+        else:
+            self.item_type = 'image/jpeg'  # assume JPEG for album art
+            self.data_start = 0
+            self.header_len = 0
+            self.size = 0  # will be set when album art is loaded
 
     def add_child(self, child):
         for _child in self.children:
@@ -248,14 +329,41 @@ class Operations(pyfuse3.Operations):
                 cursor = cursor.add_child(child)
                 if cursor.inode == self.next_inode: # if a new node was added to tree
                     self.next_inode += 1
+        
+        # Add album art files to directories
+        self._add_album_art(root)
         return root
+    
+    def _add_album_art(self, node):
+        """Recursively add album art files to directories that contain audio files"""
+        if node.beet_id == -1:  # this is a directory
+            # Check if this directory has any audio files
+            has_audio = any(child.beet_item and child.item_type in ['audio/mpeg', 'audio/flac'] 
+                          for child in node.children)
+            
+            if has_audio:
+                # Try to extract album art
+                art_data = node.extract_album_art()
+                if art_data:
+                    # Create cover.jpg file
+                    cover_name = 'cover' + art_data['ext']
+                    cover_path = node.mount_path + '/' + cover_name
+                    cover_node = TreeNode(cover_name, self.next_inode, -1, cover_path, node, is_album_art=True)
+                    cover_node.album_art_data = art_data['data']
+                    cover_node.size = len(art_data['data'])
+                    node.add_child(cover_node)
+                    self.next_inode += 1
+        
+        # Recursively process children
+        for child in node.children:
+            self._add_album_art(child)
 
     async def getattr(self, inode, ctc=None):
         BEET_LOG.debug('getattr(self, {}, ctc={})'.format(inode, ctc))
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         item = self.tree.find('inode', inode)
-        if item.beet_id == -1: # dir
+        if item.beet_id == -1 and not item.is_album_art: # dir
             entry.st_mode = (stat.S_IFDIR | 0o755)
             entry.st_nlink = 2
             # these next entries should be more meaningful
@@ -263,13 +371,20 @@ class Operations(pyfuse3.Operations):
             entry.st_atime_ns = 0
             entry.st_ctime_ns = 0
             entry.st_mtime_ns = 0
-        else: # file
+        else: # file (audio or album art)
             entry.st_mode = (stat.S_IFREG | 0o644)
             entry.st_nlink = 1
             entry.st_size = item.size
-            entry.st_atime_ns = os.path.getatime(item.beet_item.path) * 1e9
-            entry.st_ctime_ns = os.path.getctime(item.beet_item.path) * 1e9
-            entry.st_mtime_ns = os.path.getmtime(item.beet_item.path) * 1e9
+            if item.is_album_art:
+                # Use current time for album art files
+                current_time = datetime.datetime.now().timestamp() * 1e9
+                entry.st_atime_ns = current_time
+                entry.st_ctime_ns = current_time
+                entry.st_mtime_ns = current_time
+            else:
+                entry.st_atime_ns = os.path.getatime(item.beet_item.path) * 1e9
+                entry.st_ctime_ns = os.path.getctime(item.beet_item.path) * 1e9
+                entry.st_mtime_ns = os.path.getmtime(item.beet_item.path) * 1e9
         entry.st_uid = os.getuid()
         entry.st_gid = os.getgid()
         entry.st_rdev = 0 # is this necessary?
@@ -304,12 +419,21 @@ class Operations(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.EACCES)
         item = self.tree.find('inode', inode)
         BEET_LOG.debug('open: item_type={}'.format(item.item_type))
-        item.header = item.create_mp3_header() if item.item_type == 'audio/mpeg' else item.create_flac_header()
+        if not item.is_album_art:
+            item.header = item.create_mp3_header() if item.item_type == 'audio/mpeg' else item.create_flac_header()
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size):
         BEET_LOG.debug('read(self, {}, {}, {})'.format(fh, off, size))
         item = self.tree.find('inode', fh) # fh = inode
+        
+        if item.is_album_art:
+            # Handle album art file reading
+            if off >= len(item.album_art_data):
+                return b''
+            return item.album_art_data[off:off + size]
+        
+        # Handle audio file reading with custom headers
         data = b''
         if off <= item.header_len:
             data += item.header[off:off + size]
