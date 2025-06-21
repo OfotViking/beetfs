@@ -22,6 +22,7 @@ def mount(lib, opts, args):
     beetfs = Operations()
     fuse_options = set(pyfuse3.default_options)
     fuse_options.add('fsname=beetfs')
+    fuse_options.add('allow_other')
     pyfuse3.init(beetfs, args[0], fuse_options)
     try:
         trio.run(pyfuse3.main)
