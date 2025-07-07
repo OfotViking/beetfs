@@ -237,34 +237,35 @@ class TreeNode():
                 cursor += 4 + length
                 done = block_header_type & 128 != 0
         
-        # Build vorbis comment with proper field count
-        vorbis_comment = b''
+        # Build vorbis comment with proper structure
+        vendor_string = b'beets'
+        vendor_length = len(vendor_string).to_bytes(4, 'little')
+        
+        # Build comment fields
+        comment_fields = b''
         field_count = 0
         for item in self.beet_item.items():
             if item[1]:
                 field_count += 1
-                line = bytes(item[0].upper() + '=' + str(item[1]), 'utf-8')
-                line = len(line).to_bytes(4, 'little') + line
-                vorbis_comment += line
+                field_data = (item[0].upper() + '=' + str(item[1])).encode('utf-8')
+                field_length = len(field_data).to_bytes(4, 'little')
+                comment_fields += field_length + field_data
         
-        # Prepend field count and vendor string
-        vorbis_comment = field_count.to_bytes(4, 'little') + vorbis_comment
-        vorbis_comment = b'\x05\x00\x00\x00beets' + vorbis_comment # 'beets' vendor string
+        # Assemble complete vorbis comment block
+        field_count_bytes = field_count.to_bytes(4, 'little')
+        vorbis_comment = vendor_length + vendor_string + field_count_bytes + comment_fields
         sections[4] = vorbis_comment # VORBIS_COMMENT
         
         # Build header, ensuring proper last-block flags
         header = b'fLaC' # beginning of flac header
-        sorted_sections = sorted([s for s in sections.keys() if s != 1])  # exclude padding
+        sorted_sections = sorted([s for s in sections.keys() if s != 1])  # exclude original padding
         
         for i, section in enumerate(sorted_sections):
-            is_last = (i == len(sorted_sections) - 1)  # last non-padding block
-            block_type = section | (0x80 if is_last else 0x00)  # set last-block flag only for last block
+            is_last = (i == len(sorted_sections) - 1)  # check if this is the last block we'll write
+            block_type = section | (0x80 if is_last else 0x00)  # set last-block flag for final block
             header += block_type.to_bytes(1, 'big') + len(sections[section]).to_bytes(3, 'big')
             header += bytes(sections[section])
         
-        # Add padding as the final block with last-block flag
-        header += b'\x81' + FLAC_PADDING.to_bytes(3, 'big')
-        header += b'\x00' * FLAC_PADDING
         return header
 
     def __init__(self, name='', inode=1, beet_id=-1, mount_path='', parent=None, is_album_art=False):
