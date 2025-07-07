@@ -244,12 +244,23 @@ class TreeNode():
         # Build comment fields
         comment_fields = b''
         field_count = 0
+        BEET_LOG.debug(f"Available beets fields for {self.beet_item.path}: {list(self.beet_item.keys())}")
         for item in self.beet_item.items():
-            if item[1]:
+            if item[1] is not None and str(item[1]).strip():  # Check for non-empty values
                 field_count += 1
-                field_data = (item[0].upper() + '=' + str(item[1])).encode('utf-8')
+                # Map beets field names to proper vorbis comment field names
+                field_name = item[0].upper()
+                if field_name == 'TRACK':
+                    field_name = 'TRACKNUMBER'
+                elif field_name == 'DISC':
+                    field_name = 'DISCNUMBER'
+                
+                field_data = (field_name + '=' + str(item[1])).encode('utf-8')
                 field_length = len(field_data).to_bytes(4, 'little')
                 comment_fields += field_length + field_data
+                BEET_LOG.debug(f"Added FLAC vorbis comment: {field_name}={item[1]}")
+            else:
+                BEET_LOG.debug(f"Skipping empty field: {item[0]}={item[1]}")
         
         # Assemble complete vorbis comment block
         field_count_bytes = field_count.to_bytes(4, 'little')
