@@ -256,15 +256,22 @@ class TreeNode():
         vorbis_comment = vendor_length + vendor_string + field_count_bytes + comment_fields
         sections[4] = vorbis_comment # VORBIS_COMMENT
         
-        # Build header, ensuring proper last-block flags
+        # Build header, ensuring proper block ordering and last-block flags
         header = b'fLaC' # beginning of flac header
-        sorted_sections = sorted([s for s in sections.keys() if s != 1])  # exclude original padding
         
-        for i, section in enumerate(sorted_sections):
-            is_last = (i == len(sorted_sections) - 1)  # check if this is the last block we'll write
-            block_type = section | (0x80 if is_last else 0x00)  # set last-block flag for final block
-            header += block_type.to_bytes(1, 'big') + len(sections[section]).to_bytes(3, 'big')
-            header += bytes(sections[section])
+        # Process blocks in the correct order: STREAMINFO first, then others, excluding PADDING
+        block_order = [0]  # STREAMINFO must be first
+        for block_type in sorted(sections.keys()):
+            if block_type != 0 and block_type != 1:  # skip STREAMINFO (already added) and PADDING
+                block_order.append(block_type)
+        
+        for i, block_type in enumerate(block_order):
+            if block_type in sections:
+                is_last = (i == len(block_order) - 1)  # last block in our list
+                block_header = block_type | (0x80 if is_last else 0x00)
+                block_data = sections[block_type]
+                header += block_header.to_bytes(1, 'big') + len(block_data).to_bytes(3, 'big')
+                header += bytes(block_data)
         
         return header
 
@@ -273,7 +280,7 @@ class TreeNode():
         self.name = name
         self.inode = inode
         self.beet_id = beet_id
-        _beet_item = library.get_item(self.beet_id) if not is_album_art else None
+        _beet_item = library.get_item(self.beet_id) if beet_id != -1 and not is_album_art else None
         self.beet_item = None if not _beet_item else _beet_item
         self.mount_path = mount_path
         self.parent = parent
@@ -282,14 +289,35 @@ class TreeNode():
         self.is_album_art = is_album_art
         self.album_art_data = None
         
-        if not is_album_art:
-            self.item_type = self.find_type()
-            self.data_start = self.find_mp3_data_start() if self.item_type == 'audio/mpeg' else self.find_flac_data_start() # where audio frame data starts in original file
-            _header = self.create_mp3_header() if self.item_type == 'audio/mpeg' else self.create_flac_header()
-            self.header_len = False if not _header else len(_header)
-            if self.beet_item:
+        if not is_album_art and self.beet_item:
+            try:
+                self.item_type = self.find_type()
+                if self.item_type == 'audio/mpeg':
+                    self.data_start = self.find_mp3_data_start()
+                    _header = self.create_mp3_header()
+                elif self.item_type == 'audio/flac':
+                    self.data_start = self.find_flac_data_start()
+                    _header = self.create_flac_header()
+                else:
+                    self.data_start = 0
+                    _header = None
+                    
+                self.header_len = False if not _header else len(_header)
                 self.size = self.header_len + os.path.getsize(self.beet_item.path) - self.data_start
+            except Exception as e:
+                BEET_LOG.error(f"Error initializing audio node {name}: {e}")
+                self.item_type = None
+                self.data_start = 0
+                self.header_len = 0
+                self.size = 0
+        elif not is_album_art:
+            # Directory node
+            self.item_type = None
+            self.data_start = 0
+            self.header_len = 0
+            self.size = 4096
         else:
+            # Album art node
             self.item_type = 'image/jpeg'  # assume JPEG for album art
             self.data_start = 0
             self.header_len = 0
@@ -303,13 +331,15 @@ class TreeNode():
         return child
 
     def find(self, attr, target): # DFS
-        BEET_LOG.debug("Searching for {} == {}".format(attr, target))
+        BEET_LOG.debug("Searching for {} == {} (current node: {}, inode: {})".format(attr, target, self.name, self.inode))
         if getattr(self, attr) == target:
+            BEET_LOG.debug("Found match: {} == {}".format(attr, target))
             return self
         for child in self.children:
             result = child.find(attr, target)
             if result:
                 return result
+        return None
             
 class beetfs(beetsplugin):
     def commands(self):
@@ -320,12 +350,15 @@ class Operations(pyfuse3.Operations):
     def __init__(self):
         super(Operations, self).__init__()
         self.next_inode = pyfuse3.ROOT_INODE + 1
+        self.inode_map = {}  # Map path to consistent inode
         self.tree = self._build_fs_tree()
 
     def _build_fs_tree(self):
         items = list(library.items())
-        root = TreeNode()
+        BEET_LOG.debug(f'Building filesystem tree with {len(items)} items')
+        root = TreeNode(name='', inode=pyfuse3.ROOT_INODE, mount_path='')
         height = len(PATH_FORMAT)
+        
         for item in items:
             cursor = root
             for depth in range(0, height):
@@ -336,10 +369,19 @@ class Operations(pyfuse3.Operations):
                 else:
                     beet_id = -1
                 mount_path = cursor.mount_path + '/' + name
-                child = TreeNode(name, self.next_inode, beet_id, mount_path, cursor)
-                cursor = cursor.add_child(child)
-                if cursor.inode == self.next_inode: # if a new node was added to tree
+                
+                # Use consistent inode based on path
+                if mount_path in self.inode_map:
+                    inode = self.inode_map[mount_path]
+                else:
+                    inode = self.next_inode
+                    self.inode_map[mount_path] = inode
                     self.next_inode += 1
+                
+                child = TreeNode(name, inode, beet_id, mount_path, cursor)
+                cursor = cursor.add_child(child)
+        
+        BEET_LOG.debug(f'Root has {len(root.children)} children: {[child.name for child in root.children]}')
         
         # Add album art files to directories
         self._add_album_art(root)
@@ -359,11 +401,19 @@ class Operations(pyfuse3.Operations):
                     # Create cover.jpg file
                     cover_name = 'cover' + art_data['ext']
                     cover_path = node.mount_path + '/' + cover_name
-                    cover_node = TreeNode(cover_name, self.next_inode, -1, cover_path, node, is_album_art=True)
+                    
+                    # Use consistent inode for album art
+                    if cover_path in self.inode_map:
+                        cover_inode = self.inode_map[cover_path]
+                    else:
+                        cover_inode = self.next_inode
+                        self.inode_map[cover_path] = cover_inode
+                        self.next_inode += 1
+                    
+                    cover_node = TreeNode(cover_name, cover_inode, -1, cover_path, node, is_album_art=True)
                     cover_node.album_art_data = art_data['data']
                     cover_node.size = len(art_data['data'])
                     node.add_child(cover_node)
-                    self.next_inode += 1
         
         # Recursively process children
         for child in node.children:
@@ -374,6 +424,9 @@ class Operations(pyfuse3.Operations):
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         item = self.tree.find('inode', inode)
+        if not item:
+            BEET_LOG.error(f'Inode {inode} not found in tree')
+            raise pyfuse3.FUSEError(errno.ENOENT)
         if item.beet_id == -1 and not item.is_album_art: # dir
             entry.st_mode = (stat.S_IFDIR | 0o755)
             entry.st_nlink = 2
@@ -404,12 +457,23 @@ class Operations(pyfuse3.Operations):
     async def lookup(self, parent_inode, name, ctx=None):
         BEET_LOG.debug('lookup(self, {}, {}, {})'.format(parent_inode, name, ctx))
         item = self.tree.find('inode', parent_inode)
+        if not item:
+            BEET_LOG.error(f'Parent inode {parent_inode} not found in tree')
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        
+        BEET_LOG.debug(f'Parent found: {item.name}, children: {[child.name for child in item.children]}')
+        
+        # Decode name if it's bytes
+        if isinstance(name, bytes):
+            name = name.decode('utf-8')
+            
         for child in item.children:
             if child.name == name:
-                return self.getattr(child.inode)
-        ret = pyfuse3.EntryAttributes()
-        ret.st_ino = 0
-        return ret
+                BEET_LOG.debug(f'Found child {name} with inode {child.inode}')
+                return await self.getattr(child.inode)
+        
+        BEET_LOG.error(f'Child {name} not found in parent {item.name}')
+        raise pyfuse3.FUSEError(errno.ENOENT)
 
     async def opendir(self, inode, ctx):
         BEET_LOG.debug('opendir(self, {}, {})'.format(inode, ctx))
@@ -429,14 +493,33 @@ class Operations(pyfuse3.Operations):
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
         item = self.tree.find('inode', inode)
+        if not item:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        if item.beet_id == -1 and not item.is_album_art:  # trying to open a directory
+            raise pyfuse3.FUSEError(errno.EISDIR)
         BEET_LOG.debug('open: item_type={}'.format(item.item_type))
-        if not item.is_album_art:
-            item.header = item.create_mp3_header() if item.item_type == 'audio/mpeg' else item.create_flac_header()
+        
+        # Only create headers for audio files, not album art
+        if not item.is_album_art and item.beet_item:
+            try:
+                if item.item_type == 'audio/mpeg':
+                    item.header = item.create_mp3_header()
+                elif item.item_type == 'audio/flac':
+                    item.header = item.create_flac_header()
+                else:
+                    item.header = None
+            except Exception as e:
+                BEET_LOG.error(f"Error creating header for {item.name}: {e}")
+                raise pyfuse3.FUSEError(errno.EIO)
+        
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size):
         BEET_LOG.debug('read(self, {}, {}, {})'.format(fh, off, size))
         item = self.tree.find('inode', fh) # fh = inode
+        
+        if not item:
+            raise pyfuse3.FUSEError(errno.ENOENT)
         
         if item.is_album_art:
             # Handle album art file reading
@@ -445,31 +528,81 @@ class Operations(pyfuse3.Operations):
             return item.album_art_data[off:off + size]
         
         # Handle audio file reading with custom headers
+        if not item.beet_item:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+            
         data = b''
-        original_size = size
         
-        # Read from header if offset is within header range
-        if off < item.header_len:
-            header_bytes_to_read = min(size, item.header_len - off)
-            data += item.header[off:off + header_bytes_to_read]
-            size -= header_bytes_to_read
-            off += header_bytes_to_read
+        # Ensure we have header information
+        if item.header_len and item.header_len > 0:
+            # Read from header if offset is within header range
+            if off < item.header_len:
+                header_bytes_to_read = min(size, item.header_len - off)
+                data += item.header[off:off + header_bytes_to_read]
+                size -= header_bytes_to_read
+                off += header_bytes_to_read
         
         # Read from original file if there's still data to read
         if size > 0:
-            BEET_LOG.debug('data from {}'.format(item.beet_item.path))
-            with open(item.beet_item.path, 'rb') as bfile:
-                data_off = off - item.header_len + item.data_start
-                bfile.seek(data_off)
-                file_data = bfile.read(size)
-                data += file_data
+            try:
+                BEET_LOG.debug('data from {}'.format(item.beet_item.path))
+                with open(item.beet_item.path, 'rb') as bfile:
+                    data_off = off - (item.header_len if item.header_len else 0) + item.data_start
+                    bfile.seek(data_off)
+                    file_data = bfile.read(size)
+                    data += file_data
+            except Exception as e:
+                BEET_LOG.error(f"Error reading from {item.beet_item.path}: {e}")
+                raise pyfuse3.FUSEError(errno.EIO)
         
         return data
 
     async def release(self, fh):
         BEET_LOG.debug('release(self, {})'.format(fh))
         item = self.tree.find('inode', fh) # fh = inode
-        item.header = None # to prevent holding headers in memory
+        if item:
+            item.header = None # to prevent holding headers in memory
 
     async def flush(self, fh):
         BEET_LOG.debug('flush(self, {})'.format(fh))
+
+    async def statfs(self, ctx):
+        BEET_LOG.debug('statfs(self, {})'.format(ctx))
+        stat_ = pyfuse3.StatvfsData()
+        stat_.f_bsize = 4096  # block size
+        stat_.f_frsize = 4096  # fragment size
+        stat_.f_blocks = 1000000  # total blocks
+        stat_.f_bfree = 500000  # free blocks
+        stat_.f_bavail = 500000  # available blocks
+        stat_.f_files = self.next_inode  # total inodes
+        stat_.f_ffree = 0  # free inodes (read-only filesystem)
+        stat_.f_favail = 0  # available inodes
+        return stat_
+
+    async def access(self, inode, mode, ctx):
+        BEET_LOG.debug('access(self, {}, {}, {})'.format(inode, mode, ctx))
+        item = self.tree.find('inode', inode)
+        if not item:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        
+        # Check if write access is requested (not allowed)
+        if mode & os.W_OK:
+            raise pyfuse3.FUSEError(errno.EACCES)
+        
+        # Always allow read and execute for directories/files
+        return True
+
+    async def forget(self, inode_list):
+        BEET_LOG.debug('forget(self, {})'.format(inode_list))
+        # Nothing to do for read-only filesystem
+        pass
+
+    async def getxattr(self, inode, name, ctx):
+        BEET_LOG.debug('getxattr(self, {}, {}, {})'.format(inode, name, ctx))
+        # No extended attributes supported
+        raise pyfuse3.FUSEError(errno.ENODATA)
+
+    async def listxattr(self, inode, ctx):
+        BEET_LOG.debug('listxattr(self, {}, {})'.format(inode, ctx))
+        # No extended attributes
+        return []
