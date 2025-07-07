@@ -445,18 +445,24 @@ class Operations(pyfuse3.Operations):
         
         # Handle audio file reading with custom headers
         data = b''
-        if off <= item.header_len:
-            data += item.header[off:off + size]
-            if off + size > item.header_len:
-                size = size - (item.header_len - off) # overlap into audio frames
-                off = item.header_len
-            else:
-                return data
-        BEET_LOG.debug('data from {}'.format(item.beet_item.path))
-        with open(item.beet_item.path, 'rb') as bfile:
-            data_off = off - item.header_len + item.data_start
-            bfile.seek(data_off)
-            data += bfile.read(size)
+        original_size = size
+        
+        # Read from header if offset is within header range
+        if off < item.header_len:
+            header_bytes_to_read = min(size, item.header_len - off)
+            data += item.header[off:off + header_bytes_to_read]
+            size -= header_bytes_to_read
+            off += header_bytes_to_read
+        
+        # Read from original file if there's still data to read
+        if size > 0:
+            BEET_LOG.debug('data from {}'.format(item.beet_item.path))
+            with open(item.beet_item.path, 'rb') as bfile:
+                data_off = off - item.header_len + item.data_start
+                bfile.seek(data_off)
+                file_data = bfile.read(size)
+                data += file_data
+        
         return data
 
     async def release(self, fh):
