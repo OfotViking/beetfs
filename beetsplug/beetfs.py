@@ -17,6 +17,15 @@ from beets.util import sanitize_path
 
 beetfs_logger = logging.getLogger('beets')
 
+# bit flag marking synthetic album-art inodes; real inodes come from the
+# sqlite table and stay far below this
+ALBUM_ART_INODE_FLAG = 1 << 40
+
+COVER_FILE_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png',
+                    'folder.jpg', 'folder.jpeg', 'folder.png',
+                    'front.jpg', 'front.jpeg', 'front.png',
+                    'album.jpg', 'album.jpeg', 'album.png']
+
 def get_path_format():
     """fetches the path format from config else gives default value"""
     if 'beetfs' in config:
@@ -72,6 +81,7 @@ class Beetfs(beetsplugin):
             mountpoints[args[0]] = opts.query
         fuse_options = set(pyfuse3.default_options)
         fuse_options.add('fsname=beetfs')
+        fuse_options.add('allow_other')
         self.mountpoints = [mount for mount, _ in mountpoints.items()]
         for mount, query in mountpoints.items():
             pid = os.fork()
@@ -167,8 +177,91 @@ class Operations(pyfuse3.Operations):
         self.next_inode = pyfuse3.ROOT_INODE + 1
         self.path_format = get_path_format()
         self.header_cache = {'modified': 0, 'header': '', 'beet_id': 0, 'header_len': 0}
+        # keyed by directory inode; stale after an inode table rebuild, same as
+        # any other state held by a running mount
+        self.album_art_cache = {}
         # TODO()
         # self.cache_lock = trio.Lock()
+
+    def art_from_cover_file(self, source_dir):
+        """looks for a cover art file next to the source audio files"""
+        for cover_name in COVER_FILE_NAMES:
+            cover_path = os.path.join(source_dir, cover_name)
+            if not os.path.exists(cover_path):
+                continue
+            try:
+                with open(cover_path, 'rb') as cover_file:
+                    data = cover_file.read()
+            except OSError as e:
+                beetfs_logger.debug('error reading cover file {}: {}', cover_path, e)
+                continue
+            ext = os.path.splitext(cover_name)[1].lower().replace('jpeg', 'jpg')
+            return {'name': 'cover' + ext, 'data': data,
+                    'mtime_ns': int(os.path.getmtime(cover_path) * 1e9)}
+        return None
+
+    def art_from_embedded(self, item):
+        """extracts art embedded in an audio file"""
+        try:
+            data = MediaFile(os.fsdecode(item.path)).art
+        except Exception as e: # pylint: disable=broad-exception-caught
+            beetfs_logger.debug('error extracting embedded art from {}: {}', item.path, e)
+            return None
+        if not data:
+            return None
+        ext = '.png' if data.startswith(b'\x89PNG') else '.jpg'
+        return {'name': 'cover' + ext, 'data': data,
+                'mtime_ns': int(item.current_mtime() * 1e9)}
+
+    def find_album_art(self, dir_inode):
+        """finds cover art for a directory that directly contains items, cached per inode"""
+        if dir_inode in self.album_art_cache:
+            return self.album_art_cache[dir_inode]
+        art = None
+        with self.library.transaction() as tx:
+            comma_separated_columns = ', '.join([f'"{x}"' for x in self.path_format])
+            query = f'SELECT {comma_separated_columns} FROM {self.table} WHERE inode = ?'
+            rows = tx.query(query, (dir_inode, ))
+        result = [x for x in rows[0] if x != ''] if rows else []
+        if rows and len(result) == len(self.path_format) - 1: # directory of items
+            with self.library.transaction() as tx:
+                where_clause_list = []
+                for col, col_name in zip(result, self.path_format):
+                    where_clause_list.extend([col_name, col])
+                where_clause = ' AND '.join(
+                    [f'"{x.replace('"', '""')}" = ?' for x in where_clause_list[0::2]]
+                )
+                query = f'SELECT item_id FROM {self.table} WHERE {where_clause} AND item_id != ?'
+                rows = tx.query(query, tuple(where_clause_list[1::2] + ['']))
+            items = [self.library.get_item(row[0]) for row in rows]
+            items = [item for item in items if item is not None]
+            if items:
+                art = self.art_from_cover_file(os.path.dirname(os.fsdecode(items[0].path)))
+            if art is None:
+                for item in items:
+                    art = self.art_from_embedded(item)
+                    if art:
+                        break
+        self.album_art_cache[dir_inode] = art
+        return art
+
+    def album_art_getattr(self, inode):
+        """builds attributes for a synthetic album-art inode"""
+        art = self.find_album_art(inode & ~ALBUM_ART_INODE_FLAG)
+        if art is None:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        entry = pyfuse3.EntryAttributes()
+        entry.st_ino = inode
+        entry.st_mode = stat.S_IFREG | 0o644
+        entry.st_nlink = 1
+        entry.st_size = len(art['data'])
+        entry.st_atime_ns = art['mtime_ns']
+        entry.st_ctime_ns = art['mtime_ns']
+        entry.st_mtime_ns = art['mtime_ns']
+        entry.st_uid = os.getuid()
+        entry.st_gid = os.getgid()
+        entry.st_rdev = 0
+        return entry
 
     def beet_item_from_inode(self, inode):
         """fetches beets Item with inode"""
@@ -276,6 +369,8 @@ class Operations(pyfuse3.Operations):
     async def getattr(self, inode, ctx=None):
         """FUSE API implementation for 'get attributes'"""
         beetfs_logger.debug('getattr(self, {}, ctx={})', inode, ctx)
+        if inode & ALBUM_ART_INODE_FLAG:
+            return self.album_art_getattr(inode)
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         with self.library.transaction() as tx:
@@ -308,18 +403,36 @@ class Operations(pyfuse3.Operations):
     async def lookup(self, parent_inode, name, ctx=None):
         """FUSE API implementation for 'lookup'"""
         beetfs_logger.debug('lookup(self, {}, {}, {})', parent_inode, name, ctx)
-        entry = pyfuse3.EntryAttributes()
-        entry.st_mode = stat.S_IFDIR | 0o755
-        entry.st_nlink = 2
-        # these next entries should be more meaningful
-        entry.st_size = 4096
-        entry.st_atime_ns = 0
-        entry.st_ctime_ns = 0
-        entry.st_mtime_ns = 0
-        entry.st_uid = os.getuid()
-        entry.st_gid = os.getgid()
-        entry.st_rdev = 0 # is this necessary?
-        return entry
+        name = os.fsdecode(name)
+        with self.library.transaction() as tx:
+            comma_separated_columns = ', '.join([f'"{x}"' for x in self.path_format])
+            query = f'SELECT {comma_separated_columns} FROM {self.table} WHERE inode = ?'
+            rows = tx.query(query, (parent_inode, ))
+        if not rows:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        result = [x for x in rows[0] if x != '']
+        depth = len(result)
+        if depth == len(self.path_format) - 1: # children are beet items
+            art = self.find_album_art(parent_inode)
+            if art and name == art['name']:
+                return self.album_art_getattr(parent_inode | ALBUM_ART_INODE_FLAG)
+            name = os.path.splitext(name)[0] # stored names have no extension
+        with self.library.transaction() as tx:
+            where_clause_list = []
+            for col, col_name in zip(result, self.path_format):
+                where_clause_list.extend([col_name, col])
+            where_clause_list.extend([self.path_format[depth], name])
+            for col in self.path_format[depth+1:]:
+                where_clause_list.extend([col, ''])
+            where_clause = ' AND '.join(
+                [f'"{x.replace('"', '""')}" = ?' for x in where_clause_list[0::2]]
+            )
+            query = f'SELECT inode FROM {self.table} WHERE {where_clause}'
+            beetfs_logger.debug('{} {}', query, where_clause_list[1::2])
+            rows = tx.query(query, tuple(where_clause_list[1::2]))
+        if not rows:
+            raise pyfuse3.FUSEError(errno.ENOENT)
+        return await self.getattr(rows[0][0])
 
     async def opendir(self, inode, ctx):
         """FUSE API implementation for 'open directory'"""
@@ -362,12 +475,22 @@ class Operations(pyfuse3.Operations):
                 reply_name += f'.{item.format.lower()}'
             if not pyfuse3.readdir_reply(token, bytes(reply_name, encoding='utf-8'), entry, idx + 1):
                 return # token buffer full
+        art_idx = len(rows)
+        if depth == len(self.path_format)-1 and start_id <= art_idx: # directory of beet items
+            art = self.find_album_art(fh)
+            if art:
+                entry = self.album_art_getattr(fh | ALBUM_ART_INODE_FLAG)
+                pyfuse3.readdir_reply(token, bytes(art['name'], encoding='utf-8'), entry, art_idx + 1)
 
     async def open(self, inode, flags, ctx):
         """FUSE API implementation for 'open file'"""
         beetfs_logger.debug('open(self, {}, {}, {})', inode, flags, ctx)
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
+        if inode & ALBUM_ART_INODE_FLAG:
+            if self.find_album_art(inode & ~ALBUM_ART_INODE_FLAG) is None:
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            return pyfuse3.FileInfo(fh=inode)
         item = self.beet_item_from_inode(inode)
         # TODO() handle other header types
         if self.header_cache['beet_id'] != item.get('id') or item.current_mtime() > self.header_cache['modified']:
@@ -388,6 +511,11 @@ class Operations(pyfuse3.Operations):
     async def read(self, fh, off, size):
         """FUSE API implementation for 'read file'"""
         beetfs_logger.debug('read(self, {}, {}, {})', fh, off, size)
+        if fh & ALBUM_ART_INODE_FLAG:
+            art = self.find_album_art(fh & ~ALBUM_ART_INODE_FLAG)
+            if art is None:
+                raise pyfuse3.FUSEError(errno.ENOENT)
+            return art['data'][off:off + size]
         item = self.beet_item_from_inode(fh)
         data = b''
         if off <= self.header_cache['header_len']:
@@ -413,3 +541,36 @@ class Operations(pyfuse3.Operations):
     async def flush(self, fh):
         """FUSE API implementation for 'flush to file'"""
         beetfs_logger.debug('flush(self, {})', fh)
+
+    async def statfs(self, ctx):
+        """FUSE API implementation for 'get filesystem statistics'"""
+        beetfs_logger.debug('statfs(self, {})', ctx)
+        stats = pyfuse3.StatvfsData()
+        stats.f_bsize = 4096
+        stats.f_frsize = 4096
+        stats.f_blocks = 1000000
+        stats.f_bfree = 0 # read-only filesystem
+        stats.f_bavail = 0
+        stats.f_files = 1000000
+        stats.f_ffree = 0
+        stats.f_favail = 0
+        return stats
+
+    async def access(self, inode, mode, ctx):
+        """FUSE API implementation for 'check access permissions'"""
+        beetfs_logger.debug('access(self, {}, {}, {})', inode, mode, ctx)
+        return not mode & os.W_OK # read-only filesystem
+
+    async def forget(self, inode_list):
+        """FUSE API implementation for 'forget inodes'"""
+        beetfs_logger.debug('forget(self, {})', inode_list)
+
+    async def getxattr(self, inode, name, ctx):
+        """FUSE API implementation for 'get extended attribute'"""
+        beetfs_logger.debug('getxattr(self, {}, {}, {})', inode, name, ctx)
+        raise pyfuse3.FUSEError(errno.ENODATA)
+
+    async def listxattr(self, inode, ctx):
+        """FUSE API implementation for 'list extended attributes'"""
+        beetfs_logger.debug('listxattr(self, {}, {})', inode, ctx)
+        return []
