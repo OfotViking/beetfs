@@ -4,6 +4,7 @@ from io import BytesIO
 import errno
 import logging
 import os
+import sqlite3
 import stat
 import trio
 
@@ -32,6 +33,10 @@ def get_path_format():
         return config['beetfs']['path_format'].get().split('/')
     return config['paths']['default'].get().split('/')
 
+def quote_ident(name):
+    """quotes an SQL identifier such as a path format column"""
+    return '"' + name.replace('"', '""') + '"'
+
 class Beetfs(beetsplugin):
     """plugin class for adding beetfs functionality to beets"""
     def commands(self):
@@ -39,7 +44,6 @@ class Beetfs(beetsplugin):
 
     def __init__(self):
         super().__init__()
-        self.table = None
         self.mount_command = subcommand('mount', help='mount a beets filesystem')
         self.mount_command.parser.set_usage(
             '%prog mount [mountpoint] [options]'
@@ -53,17 +57,6 @@ class Beetfs(beetsplugin):
             help='query for filtering mounted items'
         )
         self.mount_command.func = self.mount
-        self.mount_query = None
-        self.mountpoints = None
-        self.mountpoint = None
-
-        def replace_inode_table_callback(lib, _paths):
-            for mountpoint in self.mountpoints:
-                self.replace_inode_table(lib, mountpoint)
-
-        # self.register_listener('database_change', replace_inode_table)
-        self.register_listener('import', replace_inode_table_callback)
-        self.register_listener('item_removed', replace_inode_table_callback)
 
     def mount(self, lib, opts, args):
         """beetfs function for mounting the pyfuse3 filesystem"""
@@ -82,15 +75,11 @@ class Beetfs(beetsplugin):
         fuse_options = set(pyfuse3.default_options)
         fuse_options.add('fsname=beetfs')
         fuse_options.add('allow_other')
-        self.mountpoints = [mount for mount, _ in mountpoints.items()]
         for mount, query in mountpoints.items():
             pid = os.fork()
             if pid == 0:
                 try:
-                    beetfs_operations = Operations(lib, mount)
-                    self.mount_query = query
-                    self.mountpoint = mount
-                    self.replace_inode_table(lib, self.mountpoint)
+                    beetfs_operations = Operations(lib, mount, query)
                     pyfuse3.init(beetfs_operations, mount, fuse_options)
                     trio.run(pyfuse3.main)
                 except Exception as e:
@@ -100,88 +89,62 @@ class Beetfs(beetsplugin):
                 pyfuse3.close()
                 os._exit(0)
 
-    def replace_inode_table(self, lib, mountpoint):
-        """creates the inodes table from scratch (every time)"""
-        beetfs_logger.info("Building inode tree for {}...", mountpoint)
-        path_format = get_path_format()
-        self.table = 'inode_' + sanitize_path(mountpoint).replace("/", "_")
-        with lib.transaction() as tx:
-            # minimal column name sanitization
-            comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}" TEXT' for x in path_format])
-            query = f'''CREATE TABLE IF NOT EXISTS {self.table} (
-                            inode INTEGER PRIMARY KEY,
-                            mountpoint TEXT,
-                            {comma_separated_columns},
-                            item_id INTEGER,
-                            item_added REAL DEFAULT 0,
-                            FOREIGN KEY (item_added) REFERENCES items(added),
-                            FOREIGN KEY (item_id) REFERENCES items(id),
-                            UNIQUE (mountpoint, {comma_separated_columns.replace(' TEXT', '')})
-                    );'''
-            beetfs_logger.debug('{}', query)
-            tx.mutate(query)
-            beetfs_logger.debug('DELETE FROM {} WHERE mountpoint = {};', self.table, mountpoint)
-            tx.mutate(f'DELETE FROM {self.table} WHERE mountpoint = ?;', (mountpoint,))
-            comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
-            comma_separated_blanks = ', '.join(['""']*len(path_format))
-            comma_separated_interos = ', '.join(['?']*len(path_format))
-            query = f'''INSERT INTO {self.table} (mountpoint, {comma_separated_columns})
-                        VALUES (?, {comma_separated_interos});'''
-            beetfs_logger.debug('{} {}', query, tuple(comma_separated_blanks))
-            # insert a blank entry for the root inode "1"
-            tx.mutate(query, (mountpoint,) + tuple([""]*len(path_format)))
-            for item in lib.items(query=self.mount_query):
-                for i in [x+1 for x in range(len(path_format))]:
-                    comma_separated_columns = ', '.join([f'"{x.replace('"', '""')}"' for x in path_format])
-                    comma_separated_columns += ', item_id, item_added, mountpoint'
-                    # replace / with _ for unix path sanity
-                    values = [
-                        f'{sanitize_path(item.evaluate_template(x, True), lib.replacements)}'
-                        for x in path_format[:i]
-                    ]
-                    # use '' instead of NULL to enable SQL UNIQUE
-                    values.extend(['']*(len(path_format)-len(values)))
-                    values.extend([str(item.get('id'))] if len(values) == len(path_format) else [''])
-                    values.extend([str(item.get('added'))])
-                    values.extend([mountpoint])
-                    comma_separated_interos = ', '.join(['?']*len(values))
-                    query = f'INSERT INTO {self.table} ({comma_separated_columns}) VALUES ({comma_separated_interos}) '
-                    query += f'''ON CONFLICT ({comma_separated_columns.replace(", item_id, item_added", "")})
-                                    DO UPDATE SET item_added = MAX({item.added}, item_added)'''
-                    beetfs_logger.debug('{} {}', query, tuple(values))
-                    tx.mutate(query, tuple(values))
-            # update root inode
-            query = f'''UPDATE {self.table} SET item_added = (SELECT MAX(item_added)
-                        FROM {self.table} WHERE inode != 1 and mountpoint = ?) WHERE inode = 1;'''
-            beetfs_logger.debug('{} {}', query, (mountpoint, ))
-            tx.mutate(query, (mountpoint, ))
-        beetfs_logger.info("Done.")
-
-    def remove_from_inode_table(self, item):
-        """removes an item from the inode table"""
-        # Access the lib through private member until there is a better way to get it
-        lib = item._db # pylint: disable=protected-access
-        with lib.transaction() as tx:
-            query = f'DELETE FROM {self.table} WHERE item_id = ?'
-            beetfs_logger.debug("{}", query)
-            beetfs_logger.info("Removing {} from beetfs", item.title)
-            tx.mutate(query, (item.id, ))
-
 class Operations(pyfuse3.Operations):
     """class providing FUSE operations read, write, open, etc."""
     enable_writeback_cache = True
-    def __init__(self, library, mountpoint):
+    def __init__(self, library, mountpoint, query):
         super().__init__()
         self.library = library
-        self.table = 'inode_' + sanitize_path(mountpoint).replace("/", "_")
-        self.next_inode = pyfuse3.ROOT_INODE + 1
         self.path_format = get_path_format()
+        self.columns = ', '.join([quote_ident(x) for x in self.path_format])
+        # each mount keeps its inode table in its own in-memory database so that
+        # building it never touches (or write-locks) the beets library.db
+        self.inode_db = sqlite3.connect(':memory:')
+        self.build_inode_table(mountpoint, query)
         self.header_cache = {'modified': 0, 'header': '', 'beet_id': 0, 'header_len': 0}
         # keyed by directory inode; stale after an inode table rebuild, same as
         # any other state held by a running mount
         self.album_art_cache = {}
-        # TODO()
-        # self.cache_lock = trio.Lock()
+
+    def inode_query(self, query, args=()):
+        """runs a query against this mount's inode table"""
+        beetfs_logger.debug('{} {}', query, args)
+        return self.inode_db.execute(query, args).fetchall()
+
+    def build_inode_table(self, mountpoint, query):
+        """creates the inodes table from the items matching query"""
+        beetfs_logger.info("Building inode tree for {}...", mountpoint)
+        column_defs = ', '.join([f'{quote_ident(x)} TEXT' for x in self.path_format])
+        insert = f'''INSERT INTO inodes ({self.columns}, item_id, item_added)
+                     VALUES ({', '.join(['?'] * (len(self.path_format) + 2))})
+                     ON CONFLICT ({self.columns})
+                     DO UPDATE SET item_added = MAX(excluded.item_added, item_added)'''
+        with self.inode_db:
+            self.inode_db.execute(f'''CREATE TABLE inodes (
+                                          inode INTEGER PRIMARY KEY,
+                                          {column_defs},
+                                          item_id INTEGER,
+                                          item_added REAL DEFAULT 0,
+                                          UNIQUE ({self.columns})
+                                      );''')
+            # insert a blank entry for the root inode "1"
+            # use '' instead of NULL to enable SQL UNIQUE
+            self.inode_db.execute(insert, [''] * len(self.path_format) + ['', 0])
+            for item in self.library.items(query=query):
+                # replace / with _ for unix path sanity
+                components = [
+                    sanitize_path(item.evaluate_template(x, True), self.library.replacements)
+                    for x in self.path_format
+                ]
+                for depth in range(1, len(components) + 1):
+                    values = components[:depth] + [''] * (len(components) - depth)
+                    values.append(item.id if depth == len(components) else '')
+                    values.append(item.added)
+                    self.inode_db.execute(insert, values)
+            # update root inode
+            self.inode_db.execute('''UPDATE inodes SET item_added = (SELECT MAX(item_added)
+                                     FROM inodes WHERE inode != 1) WHERE inode = 1;''')
+        beetfs_logger.info("Done.")
 
     def art_from_cover_file(self, source_dir):
         """looks for a cover art file next to the source audio files"""
@@ -218,21 +181,12 @@ class Operations(pyfuse3.Operations):
         if dir_inode in self.album_art_cache:
             return self.album_art_cache[dir_inode]
         art = None
-        with self.library.transaction() as tx:
-            comma_separated_columns = ', '.join([f'"{x}"' for x in self.path_format])
-            query = f'SELECT {comma_separated_columns} FROM {self.table} WHERE inode = ?'
-            rows = tx.query(query, (dir_inode, ))
+        rows = self.inode_query(f'SELECT {self.columns} FROM inodes WHERE inode = ?', (dir_inode, ))
         result = [x for x in rows[0] if x != ''] if rows else []
         if rows and len(result) == len(self.path_format) - 1: # directory of items
-            with self.library.transaction() as tx:
-                where_clause_list = []
-                for col, col_name in zip(result, self.path_format):
-                    where_clause_list.extend([col_name, col])
-                where_clause = ' AND '.join(
-                    [f'"{x.replace('"', '""')}" = ?' for x in where_clause_list[0::2]]
-                )
-                query = f'SELECT item_id FROM {self.table} WHERE {where_clause} AND item_id != ?'
-                rows = tx.query(query, tuple(where_clause_list[1::2] + ['']))
+            where_clause = ' AND '.join([f'{quote_ident(x)} = ?' for x in self.path_format[:len(result)]])
+            query = f'SELECT item_id FROM inodes WHERE {where_clause} AND item_id != ?'
+            rows = self.inode_query(query, tuple(result + ['']))
             items = [self.library.get_item(row[0]) for row in rows]
             items = [item for item in items if item is not None]
             if items:
@@ -265,10 +219,10 @@ class Operations(pyfuse3.Operations):
 
     def beet_item_from_inode(self, inode):
         """fetches beets Item with inode"""
-        with self.library.transaction() as tx:
-            query = f'SELECT item_id FROM {self.table} WHERE inode = ?'
-            rows = tx.query(query, (inode, ))
-        item = self.library.get_item(rows[0][0])
+        rows = self.inode_query('SELECT item_id FROM inodes WHERE inode = ?', (inode, ))
+        item = self.library.get_item(rows[0][0]) if rows else None
+        if item is None: # gone from the library since the mount was built
+            raise pyfuse3.FUSEError(errno.ENOENT)
         return item
 
     def create_general_header(self, item, filething):
@@ -373,12 +327,9 @@ class Operations(pyfuse3.Operations):
             return self.album_art_getattr(inode)
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
-        with self.library.transaction() as tx:
-            comma_separated_columns = ', '.join([f'"{x}"' for x in self.path_format])
-            comma_separated_columns += ', item_added'
-            query = f'SELECT {comma_separated_columns} FROM {self.table} WHERE inode = ?'
-            beetfs_logger.debug('{} {}', query, inode)
-            rows = tx.query(query, (inode, ))
+        rows = self.inode_query(f'SELECT {self.columns}, item_added FROM inodes WHERE inode = ?', (inode, ))
+        if not rows:
+            raise pyfuse3.FUSEError(errno.ENOENT)
         if len([x for x in rows[0][:-1] if x != '']) < len(self.path_format): # dir
             entry.st_mode = stat.S_IFDIR | 0o755
             entry.st_nlink = 2
@@ -404,10 +355,7 @@ class Operations(pyfuse3.Operations):
         """FUSE API implementation for 'lookup'"""
         beetfs_logger.debug('lookup(self, {}, {}, {})', parent_inode, name, ctx)
         name = os.fsdecode(name)
-        with self.library.transaction() as tx:
-            comma_separated_columns = ', '.join([f'"{x}"' for x in self.path_format])
-            query = f'SELECT {comma_separated_columns} FROM {self.table} WHERE inode = ?'
-            rows = tx.query(query, (parent_inode, ))
+        rows = self.inode_query(f'SELECT {self.columns} FROM inodes WHERE inode = ?', (parent_inode, ))
         if not rows:
             raise pyfuse3.FUSEError(errno.ENOENT)
         result = [x for x in rows[0] if x != '']
@@ -417,19 +365,9 @@ class Operations(pyfuse3.Operations):
             if art and name == art['name']:
                 return self.album_art_getattr(parent_inode | ALBUM_ART_INODE_FLAG)
             name = os.path.splitext(name)[0] # stored names have no extension
-        with self.library.transaction() as tx:
-            where_clause_list = []
-            for col, col_name in zip(result, self.path_format):
-                where_clause_list.extend([col_name, col])
-            where_clause_list.extend([self.path_format[depth], name])
-            for col in self.path_format[depth+1:]:
-                where_clause_list.extend([col, ''])
-            where_clause = ' AND '.join(
-                [f'"{x.replace('"', '""')}" = ?' for x in where_clause_list[0::2]]
-            )
-            query = f'SELECT inode FROM {self.table} WHERE {where_clause}'
-            beetfs_logger.debug('{} {}', query, where_clause_list[1::2])
-            rows = tx.query(query, tuple(where_clause_list[1::2]))
+        values = result + [name] + [''] * (len(self.path_format) - depth - 1)
+        where_clause = ' AND '.join([f'{quote_ident(x)} = ?' for x in self.path_format])
+        rows = self.inode_query(f'SELECT inode FROM inodes WHERE {where_clause}', tuple(values))
         if not rows:
             raise pyfuse3.FUSEError(errno.ENOENT)
         return await self.getattr(rows[0][0])
@@ -443,27 +381,18 @@ class Operations(pyfuse3.Operations):
     #        See: https://pyfuse3.readthedocs.io/en/latest/fuse_api.html#pyfuse3.readdir_reply
     #        Potential fix would be some sort of mutex that allows for read-only access until all
     #        readdir_reply calls are finished
-    async def readdir(self, fh, start_id, token): # pylint: disable=too-many-locals
+    async def readdir(self, fh, start_id, token):
         """FUSE API implementation for 'read directory'"""
         beetfs_logger.debug('readdir(self, {}, {}, {})', fh, start_id, token)
-        with self.library.transaction() as tx:
-            comma_separated_columns = ', '.join([f'"{x}"' for x in self.path_format])
-            query = f'SELECT {comma_separated_columns} FROM {self.table} WHERE inode = ?'
-            beetfs_logger.debug('{} {}', query, fh)
-            rows = tx.query(query, (fh, ))
+        rows = self.inode_query(f'SELECT {self.columns} FROM inodes WHERE inode = ?', (fh, ))
         result = [x for x in rows[0] if x != '']
         depth = len(result)
-        with self.library.transaction() as tx:
-            where_clause_list = []
-            for col, col_name in zip(result, self.path_format):
-                where_clause_list.extend([col_name, col])
-            for col in self.path_format[depth+1:]:
-                where_clause_list.extend([col, ''])
-            where_clause = ' AND '.join([f'"{x.replace('"', '""')}" = ?' for x in where_clause_list[0::2]])
-            col = self.path_format[depth]
-            query = f'SELECT inode, item_id, "{col}" FROM {self.table} WHERE {where_clause} AND "{col}" != ?'
-            beetfs_logger.debug('{} {}', query, where_clause_list[1::2] + [''])
-            rows = tx.query(query, tuple(where_clause_list[1::2] + ['']))
+        fixed_columns = self.path_format[:depth] + self.path_format[depth+1:]
+        col = quote_ident(self.path_format[depth])
+        where_clause = ' AND '.join([f'{quote_ident(x)} = ?' for x in fixed_columns] + [f'{col} != ?'])
+        query = f'SELECT inode, item_id, {col} FROM inodes WHERE {where_clause}'
+        values = result + [''] * (len(self.path_format) - depth - 1) + ['']
+        rows = self.inode_query(query, tuple(values))
         for idx, row in enumerate(rows):
             if idx < start_id:
                 continue
