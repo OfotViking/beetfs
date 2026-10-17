@@ -4,6 +4,7 @@ from collections import OrderedDict
 from io import BytesIO
 import errno
 import functools
+import hashlib
 import logging
 import os
 import sqlite3
@@ -35,6 +36,22 @@ HEADER_CACHE_SIZE = 32
 
 # how many directories' cover art to keep in memory
 ALBUM_ART_CACHE_SIZE = 64
+
+# Disk and beets-database work runs in worker threads so one slow request (a header
+# build, a disk spinning up) doesn't hold up every other request, e.g. a playing
+# stream. Header/art building gets its own small pool so a library scan can't take
+# all the threads that audio reads need.
+METADATA_THREADS = 4
+
+def read_source(path, offset, size):
+    """reads size bytes at offset from a source file; blocking, runs in a worker thread"""
+    with open(path, 'rb') as bfile:
+        bfile.seek(offset)
+        return bfile.read(size)
+
+def tags_digest(tags):
+    """a compact fingerprint of an item's tags, used as part of the header cache key"""
+    return hashlib.blake2b(repr(sorted(tags.items())).encode(), digest_size=16).digest()
 
 def fuse_handler(func):
     """turns unexpected exceptions in a FUSE handler into an errno for that one request
@@ -137,6 +154,15 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         # so it is bounded. Directories without art are remembered separately.
         self.album_art_cache = OrderedDict()
         self.no_album_art = set()
+        self.metadata_limiter = trio.CapacityLimiter(METADATA_THREADS)
+
+    async def in_thread(self, func, *args):
+        """runs blocking I/O in a worker thread; for quick calls on the audio read path"""
+        return await trio.to_thread.run_sync(func, *args)
+
+    async def in_metadata_thread(self, func, *args):
+        """runs slow metadata work (header and art building) in the bounded metadata pool"""
+        return await trio.to_thread.run_sync(func, *args, limiter=self.metadata_limiter)
 
     def inode_query(self, query, args=()):
         """runs a query against this mount's inode table"""
@@ -147,10 +173,13 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         """creates the inodes table from the items matching query"""
         beetfs_logger.info("Building inode tree for {}...", mountpoint)
         column_defs = ', '.join([f'{quote_ident(x)} TEXT' for x in self.path_format])
-        insert = f'''INSERT INTO inodes ({self.columns}, item_id, item_added)
-                     VALUES ({', '.join(['?'] * (len(self.path_format) + 2))})
-                     ON CONFLICT ({self.columns})
+        insert_item = f'''INSERT INTO inodes ({self.columns}, item_id, item_added)
+                          VALUES ({', '.join(['?'] * (len(self.path_format) + 2))})'''
+        # directories are shared by many items: inserting an existing one just
+        # updates its timestamp
+        insert = insert_item + f''' ON CONFLICT ({self.columns})
                      DO UPDATE SET item_added = MAX(excluded.item_added, item_added)'''
+        collisions = 0
         with self.inode_db:
             self.inode_db.execute(f'''CREATE TABLE inodes (
                                           inode INTEGER PRIMARY KEY,
@@ -165,17 +194,32 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             for item in self.library.items(query=query):
                 # replace / with _ for unix path sanity
                 components = [
-                    sanitize_path(item.evaluate_template(x, True), self.library.replacements)
+                    # an empty component would make the row look like its parent directory
+                    sanitize_path(item.evaluate_template(x, True), self.library.replacements) or '_'
                     for x in self.path_format
                 ]
-                for depth in range(1, len(components) + 1):
+                for depth in range(1, len(components)):
                     values = components[:depth] + [''] * (len(components) - depth)
-                    values.append(item.id if depth == len(components) else '')
-                    values.append(item.added)
+                    values += ['', item.added]
                     self.inode_db.execute(insert, values)
+                try:
+                    self.inode_db.execute(insert_item, components + [item.id, item.added])
+                except sqlite3.IntegrityError:
+                    # another item already has this path (e.g. a second edition of an
+                    # album, or two discs that both have a "01 Intro"). Keep both,
+                    # telling them apart by the beets id, which is stable across remounts.
+                    collisions += 1
+                    original = '/'.join(components)
+                    components[-1] += f' [{item.id}]'
+                    self.inode_db.execute(insert_item, components + [item.id, item.added])
+                    beetfs_logger.warning('beetfs: {} is already taken, serving item {} as {}',
+                                          original, item.id, '/'.join(components))
             # update root inode
             self.inode_db.execute('''UPDATE inodes SET item_added = (SELECT MAX(item_added)
                                      FROM inodes WHERE inode != 1) WHERE inode = 1;''')
+        if collisions:
+            beetfs_logger.warning('beetfs: {} items had the same path as another item; consider '
+                                  'adding $disc and %aunique{{}} to beetfs.path_format', collisions)
         beetfs_logger.info("Done.")
 
     def art_from_cover_file(self, source_dir):
@@ -208,7 +252,21 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         return {'name': 'cover' + ext, 'data': data,
                 'mtime_ns': int(item.current_mtime() * 1e9)}
 
-    def find_album_art(self, dir_inode):
+    def load_album_art(self, item_ids):
+        """reads cover art for a directory's items; blocking, runs in a worker thread"""
+        items = [self.library.get_item(item_id) for item_id in item_ids]
+        items = [item for item in items if item is not None]
+        art = None
+        if items:
+            art = self.art_from_cover_file(os.path.dirname(os.fsdecode(items[0].path)))
+        if art is None:
+            for item in items:
+                art = self.art_from_embedded(item)
+                if art:
+                    break
+        return art
+
+    async def find_album_art(self, dir_inode):
         """finds cover art for a directory that directly contains items, cached per inode"""
         if dir_inode in self.no_album_art:
             return None
@@ -222,15 +280,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             where_clause = ' AND '.join([f'{quote_ident(x)} = ?' for x in self.path_format[:len(result)]])
             query = f'SELECT item_id FROM inodes WHERE {where_clause} AND item_id != ?'
             rows = self.inode_query(query, tuple(result + ['']))
-            items = [self.library.get_item(row[0]) for row in rows]
-            items = [item for item in items if item is not None]
-            if items:
-                art = self.art_from_cover_file(os.path.dirname(os.fsdecode(items[0].path)))
-            if art is None:
-                for item in items:
-                    art = self.art_from_embedded(item)
-                    if art:
-                        break
+            art = await self.in_metadata_thread(self.load_album_art, [row[0] for row in rows])
         if art is None:
             self.no_album_art.add(dir_inode)
         else:
@@ -239,9 +289,9 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                 self.album_art_cache.popitem(last=False)
         return art
 
-    def album_art_getattr(self, inode):
+    async def album_art_getattr(self, inode):
         """builds attributes for a synthetic album-art inode"""
-        art = self.find_album_art(inode & ~ALBUM_ART_INODE_FLAG)
+        art = await self.find_album_art(inode & ~ALBUM_ART_INODE_FLAG)
         if art is None:
             raise pyfuse3.FUSEError(errno.ENOENT)
         entry = pyfuse3.EntryAttributes()
@@ -257,10 +307,11 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         entry.st_rdev = 0
         return entry
 
-    def beet_item_from_inode(self, inode):
+    async def beet_item_from_inode(self, inode):
         """fetches beets Item with inode"""
         rows = self.inode_query('SELECT item_id FROM inodes WHERE inode = ?', (inode, ))
-        item = self.library.get_item(rows[0][0]) if rows else None
+        # beets may hold its database locked (e.g. during an import), so don't wait in the event loop
+        item = await self.in_thread(self.library.get_item, rows[0][0]) if rows else None
         if item is None: # gone from the library since the mount was built
             raise pyfuse3.FUSEError(errno.ENOENT)
         return item
@@ -323,33 +374,46 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                 beetfs_logger.warning('File at {} is of unsupported filetype.', item.path)
                 return None
 
-    def header_for(self, item, need_header=False):
-        """returns (info, header) for the file served for item, rebuilding them when the
-        source file or the item's tags have changed; header is only guaranteed when
-        need_header is set"""
+    @staticmethod
+    def source_key(item):
+        """stats the source file and fingerprints the item's tags; blocking, runs in a
+        worker thread. Returns (tags, stat, cache key)."""
         tags = {k: v for k, v in item.items() if k in item._media_fields}  # pylint: disable=protected-access
         source_stat = os.stat(item.path)
-        key = (source_stat.st_mtime_ns, source_stat.st_size, tags)
-        info = self.header_info.get(item.id)
-        if info is not None and info['key'] == key:
-            if not need_header:
-                return info, None
-            if item.id in self.header_data:
-                self.header_data.move_to_end(item.id)
-                return info, self.header_data[item.id]
+        return tags, source_stat, (source_stat.st_mtime_ns, source_stat.st_size, tags_digest(tags))
+
+    def build_header(self, item, tags):
+        """builds the header served for item; blocking, runs in a worker thread.
+        Returns (data_start, header)."""
         try:
             data_start = self.find_data_start(item)
             if data_start is None: # unsupported format, serve the source file untouched
-                data_start, header = 0, b''
-            else:
-                header = self.create_header(item, tags, data_start)
+                return 0, b''
+            return data_start, self.create_header(item, tags, data_start)
         except OSError:
             raise
         except Exception as e: # pylint: disable=broad-exception-caught
             # e.g. a FLAC with an ID3 tag in front of it: still playable, so serve it
             # untouched with its original tags rather than failing the request
             beetfs_logger.warning('beetfs: serving {} unmodified: {!r}', item.path, e)
-            data_start, header = 0, b''
+            return 0, b''
+
+    async def header_for(self, item, need_header=False):
+        """returns (info, header, source stat) for the file served for item, rebuilding
+        them when the source file or the item's tags have changed; header is only
+        guaranteed when need_header is set.
+
+        The cache dicts are only touched here, on the event loop thread; the blocking
+        parts run in worker threads."""
+        tags, source_stat, key = await self.in_thread(self.source_key, item)
+        info = self.header_info.get(item.id)
+        if info is not None and info['key'] == key:
+            if not need_header:
+                return info, None, source_stat
+            if item.id in self.header_data:
+                self.header_data.move_to_end(item.id)
+                return info, self.header_data[item.id], source_stat
+        data_start, header = await self.in_metadata_thread(self.build_header, item, tags)
         info = {'key': key, 'header_len': len(header), 'data_start': data_start,
                 'size': len(header) + source_stat.st_size - data_start}
         self.header_info[item.id] = info
@@ -359,14 +423,14 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             self.header_data.popitem(last=False)
         beetfs_logger.debug('built header for {}: {}', item.path,
                             {k: v for k, v in info.items() if k != 'key'})
-        return info, header
+        return info, header, source_stat
 
     @fuse_handler
     async def getattr(self, inode, ctx=None):
         """FUSE API implementation for 'get attributes'"""
         beetfs_logger.debug('getattr(self, {}, ctx={})', inode, ctx)
         if inode & ALBUM_ART_INODE_FLAG:
-            return self.album_art_getattr(inode)
+            return await self.album_art_getattr(inode)
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
         rows = self.inode_query(f'SELECT {self.columns}, item_added FROM inodes WHERE inode = ?', (inode, ))
@@ -381,12 +445,12 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             entry.st_ctime_ns = 0
             entry.st_mtime_ns = int(float(rows[0][-1]) * 1e9)
         else: # file
-            item = self.beet_item_from_inode(inode)
-            source_stat = os.stat(item.path)
+            item = await self.beet_item_from_inode(inode)
+            info, _, source_stat = await self.header_for(item)
             entry.st_mode = stat.S_IFREG | 0o644
             entry.st_nlink = 1
             # the served file is the rewritten header plus the source audio
-            entry.st_size = self.header_for(item)[0]['size']
+            entry.st_size = info['size']
             entry.st_atime_ns = source_stat.st_atime_ns
             entry.st_ctime_ns = source_stat.st_ctime_ns
             entry.st_mtime_ns = source_stat.st_mtime_ns
@@ -406,9 +470,9 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         result = [x for x in rows[0] if x != '']
         depth = len(result)
         if depth == len(self.path_format) - 1: # children are beet items
-            art = self.find_album_art(parent_inode)
+            art = await self.find_album_art(parent_inode)
             if art and name == art['name']:
-                return self.album_art_getattr(parent_inode | ALBUM_ART_INODE_FLAG)
+                return await self.album_art_getattr(parent_inode | ALBUM_ART_INODE_FLAG)
             name = os.path.splitext(name)[0] # stored names have no extension
         values = result + [name] + [''] * (len(self.path_format) - depth - 1)
         where_clause = ' AND '.join([f'{quote_ident(x)} = ?' for x in self.path_format])
@@ -448,7 +512,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                 # TODO() store the result here and manage lookup count
                 reply_name = row[2]
                 if depth == len(self.path_format)-1: # beet item
-                    item = self.library.get_item(row[1])
+                    item = await self.in_thread(self.library.get_item, row[1])
                     if item is None: # removed from the library since the mount was built
                         continue
                     reply_name += f'.{item.format.lower()}'
@@ -458,9 +522,9 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                 return # token buffer full
         art_idx = len(rows)
         if depth == len(self.path_format)-1 and start_id <= art_idx: # directory of beet items
-            art = self.find_album_art(fh)
+            art = await self.find_album_art(fh)
             if art:
-                entry = self.album_art_getattr(fh | ALBUM_ART_INODE_FLAG)
+                entry = await self.album_art_getattr(fh | ALBUM_ART_INODE_FLAG)
                 pyfuse3.readdir_reply(token, bytes(art['name'], encoding='utf-8'), entry, art_idx + 1)
 
     @fuse_handler
@@ -470,11 +534,11 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         if flags & os.O_RDWR or flags & os.O_WRONLY:
             raise pyfuse3.FUSEError(errno.EACCES)
         if inode & ALBUM_ART_INODE_FLAG:
-            if self.find_album_art(inode & ~ALBUM_ART_INODE_FLAG) is None:
+            if await self.find_album_art(inode & ~ALBUM_ART_INODE_FLAG) is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
             return pyfuse3.FileInfo(fh=inode)
         # build the header now so the first read() doesn't have to
-        self.header_for(self.beet_item_from_inode(inode), need_header=True)
+        await self.header_for(await self.beet_item_from_inode(inode), need_header=True)
         return pyfuse3.FileInfo(fh=inode)
 
     @fuse_handler
@@ -482,18 +546,18 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         """FUSE API implementation for 'read file'"""
         beetfs_logger.debug('read(self, {}, {}, {})', fh, off, size)
         if fh & ALBUM_ART_INODE_FLAG:
-            art = self.find_album_art(fh & ~ALBUM_ART_INODE_FLAG)
+            art = await self.find_album_art(fh & ~ALBUM_ART_INODE_FLAG)
             if art is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
             return art['data'][off:off + size]
-        item = self.beet_item_from_inode(fh)
-        info, header = self.header_for(item, need_header=True)
+        item = await self.beet_item_from_inode(fh)
+        info, header, _ = await self.header_for(item, need_header=True)
         data = header[off:off + size]
         if off + size > info['header_len']: # overlap into audio frames
             beetfs_logger.debug('data from {}', item.path)
-            with open(item.path, 'rb') as bfile:
-                bfile.seek(info['data_start'] + max(off - info['header_len'], 0))
-                data += bfile.read(size - len(data))
+            data += await self.in_thread(read_source, item.path,
+                                         info['data_start'] + max(off - info['header_len'], 0),
+                                         size - len(data))
         return data
 
     @fuse_handler
