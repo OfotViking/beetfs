@@ -3,6 +3,7 @@
 from collections import OrderedDict
 from io import BytesIO
 import errno
+import functools
 import logging
 import os
 import sqlite3
@@ -31,6 +32,29 @@ COVER_FILE_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png',
 # how many rewritten headers to keep in memory; headers can carry embedded art,
 # so only their lengths are kept for every item
 HEADER_CACHE_SIZE = 32
+
+# how many directories' cover art to keep in memory
+ALBUM_ART_CACHE_SIZE = 64
+
+def fuse_handler(func):
+    """turns unexpected exceptions in a FUSE handler into an errno for that one request
+
+    pyfuse3 only maps FUSEError to an errno; any other exception escaping a
+    handler ends pyfuse3.main() and takes the whole mount down with it.
+    """
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except pyfuse3.FUSEError:
+            raise
+        except FileNotFoundError as e:
+            beetfs_logger.warning('beetfs: {}: source file missing: {}', func.__name__, e)
+            raise pyfuse3.FUSEError(errno.ENOENT) from e
+        except Exception as e: # pylint: disable=broad-exception-caught
+            beetfs_logger.error('beetfs: {} failed: {!r}', func.__name__, e)
+            raise pyfuse3.FUSEError(errno.EIO) from e
+    return wrapper
 
 def get_path_format():
     """fetches the path format from config else gives default value"""
@@ -94,7 +118,7 @@ class Beetfs(beetsplugin):
                 pyfuse3.close()
                 os._exit(0)
 
-class Operations(pyfuse3.Operations):
+class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attributes
     """class providing FUSE operations read, write, open, etc."""
     def __init__(self, library, mountpoint, query):
         super().__init__()
@@ -109,9 +133,10 @@ class Operations(pyfuse3.Operations):
         self.header_info = {}
         # keyed by item id, least recently used first
         self.header_data = OrderedDict()
-        # keyed by directory inode; stale after an inode table rebuild, same as
-        # any other state held by a running mount
-        self.album_art_cache = {}
+        # keyed by directory inode, least recently used first; holds image data,
+        # so it is bounded. Directories without art are remembered separately.
+        self.album_art_cache = OrderedDict()
+        self.no_album_art = set()
 
     def inode_query(self, query, args=()):
         """runs a query against this mount's inode table"""
@@ -185,7 +210,10 @@ class Operations(pyfuse3.Operations):
 
     def find_album_art(self, dir_inode):
         """finds cover art for a directory that directly contains items, cached per inode"""
+        if dir_inode in self.no_album_art:
+            return None
         if dir_inode in self.album_art_cache:
+            self.album_art_cache.move_to_end(dir_inode)
             return self.album_art_cache[dir_inode]
         art = None
         rows = self.inode_query(f'SELECT {self.columns} FROM inodes WHERE inode = ?', (dir_inode, ))
@@ -203,7 +231,12 @@ class Operations(pyfuse3.Operations):
                     art = self.art_from_embedded(item)
                     if art:
                         break
-        self.album_art_cache[dir_inode] = art
+        if art is None:
+            self.no_album_art.add(dir_inode)
+        else:
+            self.album_art_cache[dir_inode] = art
+            while len(self.album_art_cache) > ALBUM_ART_CACHE_SIZE:
+                self.album_art_cache.popitem(last=False)
         return art
 
     def album_art_getattr(self, inode):
@@ -304,11 +337,19 @@ class Operations(pyfuse3.Operations):
             if item.id in self.header_data:
                 self.header_data.move_to_end(item.id)
                 return info, self.header_data[item.id]
-        data_start = self.find_data_start(item)
-        if data_start is None: # unsupported format, serve the source file untouched
+        try:
+            data_start = self.find_data_start(item)
+            if data_start is None: # unsupported format, serve the source file untouched
+                data_start, header = 0, b''
+            else:
+                header = self.create_header(item, tags, data_start)
+        except OSError:
+            raise
+        except Exception as e: # pylint: disable=broad-exception-caught
+            # e.g. a FLAC with an ID3 tag in front of it: still playable, so serve it
+            # untouched with its original tags rather than failing the request
+            beetfs_logger.warning('beetfs: serving {} unmodified: {!r}', item.path, e)
             data_start, header = 0, b''
-        else:
-            header = self.create_header(item, tags, data_start)
         info = {'key': key, 'header_len': len(header), 'data_start': data_start,
                 'size': len(header) + source_stat.st_size - data_start}
         self.header_info[item.id] = info
@@ -320,6 +361,7 @@ class Operations(pyfuse3.Operations):
                             {k: v for k, v in info.items() if k != 'key'})
         return info, header
 
+    @fuse_handler
     async def getattr(self, inode, ctx=None):
         """FUSE API implementation for 'get attributes'"""
         beetfs_logger.debug('getattr(self, {}, ctx={})', inode, ctx)
@@ -353,6 +395,7 @@ class Operations(pyfuse3.Operations):
         entry.st_rdev = 0 # is this necessary?
         return entry
 
+    @fuse_handler
     async def lookup(self, parent_inode, name, ctx=None):
         """FUSE API implementation for 'lookup'"""
         beetfs_logger.debug('lookup(self, {}, {}, {})', parent_inode, name, ctx)
@@ -374,6 +417,7 @@ class Operations(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         return await self.getattr(rows[0][0])
 
+    @fuse_handler
     async def opendir(self, inode, ctx):
         """FUSE API implementation for 'open directory'"""
         beetfs_logger.debug('opendir(self, {}, {})', inode, ctx)
@@ -383,6 +427,7 @@ class Operations(pyfuse3.Operations):
     #        See: https://pyfuse3.readthedocs.io/en/latest/fuse_api.html#pyfuse3.readdir_reply
     #        Potential fix would be some sort of mutex that allows for read-only access until all
     #        readdir_reply calls are finished
+    @fuse_handler
     async def readdir(self, fh, start_id, token):
         """FUSE API implementation for 'read directory'"""
         beetfs_logger.debug('readdir(self, {}, {}, {})', fh, start_id, token)
@@ -398,12 +443,17 @@ class Operations(pyfuse3.Operations):
         for idx, row in enumerate(rows):
             if idx < start_id:
                 continue
-            entry = await self.getattr(row[0])
-            # TODO() store the result here and manage lookup count
-            reply_name = row[2]
-            if depth == len(self.path_format)-1: # beet item
-                item = self.library.get_item(row[1])
-                reply_name += f'.{item.format.lower()}'
+            try:
+                entry = await self.getattr(row[0])
+                # TODO() store the result here and manage lookup count
+                reply_name = row[2]
+                if depth == len(self.path_format)-1: # beet item
+                    item = self.library.get_item(row[1])
+                    if item is None: # removed from the library since the mount was built
+                        continue
+                    reply_name += f'.{item.format.lower()}'
+            except pyfuse3.FUSEError:
+                continue # leave out the one broken entry rather than failing the whole listing
             if not pyfuse3.readdir_reply(token, bytes(reply_name, encoding='utf-8'), entry, idx + 1):
                 return # token buffer full
         art_idx = len(rows)
@@ -413,6 +463,7 @@ class Operations(pyfuse3.Operations):
                 entry = self.album_art_getattr(fh | ALBUM_ART_INODE_FLAG)
                 pyfuse3.readdir_reply(token, bytes(art['name'], encoding='utf-8'), entry, art_idx + 1)
 
+    @fuse_handler
     async def open(self, inode, flags, ctx):
         """FUSE API implementation for 'open file'"""
         beetfs_logger.debug('open(self, {}, {}, {})', inode, flags, ctx)
@@ -426,6 +477,7 @@ class Operations(pyfuse3.Operations):
         self.header_for(self.beet_item_from_inode(inode), need_header=True)
         return pyfuse3.FileInfo(fh=inode)
 
+    @fuse_handler
     async def read(self, fh, off, size):
         """FUSE API implementation for 'read file'"""
         beetfs_logger.debug('read(self, {}, {}, {})', fh, off, size)
@@ -444,14 +496,17 @@ class Operations(pyfuse3.Operations):
                 data += bfile.read(size - len(data))
         return data
 
+    @fuse_handler
     async def release(self, fh):
         """FUSE API implementation for 'release file descriptor'"""
         beetfs_logger.debug('release(self, {})', fh)
 
+    @fuse_handler
     async def flush(self, fh):
         """FUSE API implementation for 'flush to file'"""
         beetfs_logger.debug('flush(self, {})', fh)
 
+    @fuse_handler
     async def statfs(self, ctx):
         """FUSE API implementation for 'get filesystem statistics'"""
         beetfs_logger.debug('statfs(self, {})', ctx)
@@ -466,20 +521,24 @@ class Operations(pyfuse3.Operations):
         stats.f_favail = 0
         return stats
 
+    @fuse_handler
     async def access(self, inode, mode, ctx):
         """FUSE API implementation for 'check access permissions'"""
         beetfs_logger.debug('access(self, {}, {}, {})', inode, mode, ctx)
         return not mode & os.W_OK # read-only filesystem
 
+    @fuse_handler
     async def forget(self, inode_list):
         """FUSE API implementation for 'forget inodes'"""
         beetfs_logger.debug('forget(self, {})', inode_list)
 
+    @fuse_handler
     async def getxattr(self, inode, name, ctx):
         """FUSE API implementation for 'get extended attribute'"""
         beetfs_logger.debug('getxattr(self, {}, {}, {})', inode, name, ctx)
         raise pyfuse3.FUSEError(errno.ENODATA)
 
+    @fuse_handler
     async def listxattr(self, inode, ctx):
         """FUSE API implementation for 'list extended attributes'"""
         beetfs_logger.debug('listxattr(self, {}, {})', inode, ctx)
