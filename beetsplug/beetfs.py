@@ -1,5 +1,6 @@
 """Module providing the beetfs plugin for beets"""
 
+from collections import OrderedDict
 from io import BytesIO
 import errno
 import logging
@@ -26,6 +27,10 @@ COVER_FILE_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png',
                     'folder.jpg', 'folder.jpeg', 'folder.png',
                     'front.jpg', 'front.jpeg', 'front.png',
                     'album.jpg', 'album.jpeg', 'album.png']
+
+# how many rewritten headers to keep in memory; headers can carry embedded art,
+# so only their lengths are kept for every item
+HEADER_CACHE_SIZE = 32
 
 def get_path_format():
     """fetches the path format from config else gives default value"""
@@ -91,7 +96,6 @@ class Beetfs(beetsplugin):
 
 class Operations(pyfuse3.Operations):
     """class providing FUSE operations read, write, open, etc."""
-    enable_writeback_cache = True
     def __init__(self, library, mountpoint, query):
         super().__init__()
         self.library = library
@@ -101,7 +105,10 @@ class Operations(pyfuse3.Operations):
         # building it never touches (or write-locks) the beets library.db
         self.inode_db = sqlite3.connect(':memory:')
         self.build_inode_table(mountpoint, query)
-        self.header_cache = {'modified': 0, 'header': '', 'beet_id': 0, 'header_len': 0}
+        # keyed by item id: {'key', 'header_len', 'data_start', 'size'}
+        self.header_info = {}
+        # keyed by item id, least recently used first
+        self.header_data = OrderedDict()
         # keyed by directory inode; stale after an inode table rebuild, same as
         # any other state held by a running mount
         self.album_art_cache = {}
@@ -225,61 +232,24 @@ class Operations(pyfuse3.Operations):
             raise pyfuse3.FUSEError(errno.ENOENT)
         return item
 
-    def create_general_header(self, item, filething):
+    def create_general_header(self, tags, filething):
         """creates a header using MediaFile write"""
         id3v23 = config["id3v23"].get(bool)
-        # only write media fields
-        item_tags = { k: v for k, v in item.items() if k in item._media_fields }  # pylint: disable=protected-access
-
         mediafile = MediaFile(filething, id3v23=id3v23)
-        mediafile.update(item_tags)
+        mediafile.update(tags)
         filething.seek(0)
         mediafile.save()
         filething.seek(0)
         return filething.read()
 
-    def create_mp3_header(self, item):
-        """creates the ID3 metadata for an mp3 file"""
+    def create_header(self, item, tags, data_start):
+        """rewrites the metadata before data_start in the source file with tags"""
         with open(item.path, 'rb') as f:
-            id3_header = f.read(10) # ID3 header is 10 bytes
-            # bytes 6-9 are tag size as a syncsafe integer
-            size = (id3_header[6] << 21 | id3_header[7] << 14 |
-                    id3_header[8] << 7  | id3_header[9])
-            id3_data = id3_header + f.read(size)
-            audio_frames = f.read(4096) # arbitrary number of frames for mutagen
-            filething = BytesIO(id3_data + audio_frames)
-        return self.create_general_header(item, filething)[:-4096] # remove fake frame data
-
-    def get_flac_metadata_blocks_size(self, filething):
-        """gets the size of the metadata blocks at the beginning of the source flac"""
-        filething.seek(4) # first 4 bytes are 'fLaC'
-        while True:
-            block_header_type = int(filething.read(1).hex(), 16)
-            length = int(filething.read(3).hex(), 16)
-            filething.seek(length, os.SEEK_CUR)
-            if block_header_type & 128 != 0:
-                break
-        return filething.tell()
-
-    def create_flac_header(self, item):
-        """creates the vorbis comments metadata for a flac file"""
-        with open(item.path, 'rb') as f:
-            header_size = self.get_flac_metadata_blocks_size(f)
-            f.seek(0)
-            filething = BytesIO(f.read(header_size))
-        ret = self.create_general_header(item, filething)
-        return ret
-
-    def create_header(self, item):
-        """chooses which metadata to create based on format reported by beets"""
-        match item.format:
-            case "FLAC":
-                return self.create_flac_header(item)
-            case "MP3":
-                return self.create_mp3_header(item)
-            case _:
-                beetfs_logger.warning('File at {} is of unsupported filetype.', item.path)
-                return None
+            source_header = f.read(data_start)
+            # mutagen needs a few mp3 frames after the ID3 tag to recognise the file
+            audio_frames = f.read(4096) if item.format == 'MP3' else b''
+        header = self.create_general_header(tags, BytesIO(source_header + audio_frames))
+        return header[:len(header) - len(audio_frames)] # remove fake frame data
 
     def find_mp3_data_start(self, item):
         """finds the offset in a source mp3 where the audio frames begin"""
@@ -320,6 +290,36 @@ class Operations(pyfuse3.Operations):
                 beetfs_logger.warning('File at {} is of unsupported filetype.', item.path)
                 return None
 
+    def header_for(self, item, need_header=False):
+        """returns (info, header) for the file served for item, rebuilding them when the
+        source file or the item's tags have changed; header is only guaranteed when
+        need_header is set"""
+        tags = {k: v for k, v in item.items() if k in item._media_fields}  # pylint: disable=protected-access
+        source_stat = os.stat(item.path)
+        key = (source_stat.st_mtime_ns, source_stat.st_size, tags)
+        info = self.header_info.get(item.id)
+        if info is not None and info['key'] == key:
+            if not need_header:
+                return info, None
+            if item.id in self.header_data:
+                self.header_data.move_to_end(item.id)
+                return info, self.header_data[item.id]
+        data_start = self.find_data_start(item)
+        if data_start is None: # unsupported format, serve the source file untouched
+            data_start, header = 0, b''
+        else:
+            header = self.create_header(item, tags, data_start)
+        info = {'key': key, 'header_len': len(header), 'data_start': data_start,
+                'size': len(header) + source_stat.st_size - data_start}
+        self.header_info[item.id] = info
+        self.header_data[item.id] = header
+        self.header_data.move_to_end(item.id)
+        while len(self.header_data) > HEADER_CACHE_SIZE:
+            self.header_data.popitem(last=False)
+        beetfs_logger.debug('built header for {}: {}', item.path,
+                            {k: v for k, v in info.items() if k != 'key'})
+        return info, header
+
     async def getattr(self, inode, ctx=None):
         """FUSE API implementation for 'get attributes'"""
         beetfs_logger.debug('getattr(self, {}, ctx={})', inode, ctx)
@@ -340,12 +340,14 @@ class Operations(pyfuse3.Operations):
             entry.st_mtime_ns = int(float(rows[0][-1]) * 1e9)
         else: # file
             item = self.beet_item_from_inode(inode)
+            source_stat = os.stat(item.path)
             entry.st_mode = stat.S_IFREG | 0o644
             entry.st_nlink = 1
-            entry.st_size = item.try_filesize()
-            entry.st_atime_ns = os.path.getatime(str(item.filepath)) * 1e9
-            entry.st_ctime_ns = os.path.getctime(str(item.filepath)) * 1e9
-            entry.st_mtime_ns = os.path.getmtime(str(item.filepath)) * 1e9
+            # the served file is the rewritten header plus the source audio
+            entry.st_size = self.header_for(item)[0]['size']
+            entry.st_atime_ns = source_stat.st_atime_ns
+            entry.st_ctime_ns = source_stat.st_ctime_ns
+            entry.st_mtime_ns = source_stat.st_mtime_ns
         entry.st_uid = os.getuid()
         entry.st_gid = os.getgid()
         entry.st_rdev = 0 # is this necessary?
@@ -420,21 +422,8 @@ class Operations(pyfuse3.Operations):
             if self.find_album_art(inode & ~ALBUM_ART_INODE_FLAG) is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
             return pyfuse3.FileInfo(fh=inode)
-        item = self.beet_item_from_inode(inode)
-        # TODO() handle other header types
-        if self.header_cache['beet_id'] != item.get('id') or item.current_mtime() > self.header_cache['modified']:
-            self.header_cache['header'] = self.create_header(item)
-            self.header_cache['data_start'] = self.find_data_start(item)
-            self.header_cache['header_len'] = len(self.header_cache['header'])
-            self.header_cache['beet_id'] = item.get('id')
-            self.header_cache['modified'] = item.current_mtime()
-            beetfs_logger.debug("cache miss, fetched:")
-            for k, v in self.header_cache.items():
-                if k == 'header':
-                    continue
-                beetfs_logger.debug('{} {}', k, v)
-        else:
-            beetfs_logger.debug("cache hit")
+        # build the header now so the first read() doesn't have to
+        self.header_for(self.beet_item_from_inode(inode), need_header=True)
         return pyfuse3.FileInfo(fh=inode)
 
     async def read(self, fh, off, size):
@@ -446,26 +435,18 @@ class Operations(pyfuse3.Operations):
                 raise pyfuse3.FUSEError(errno.ENOENT)
             return art['data'][off:off + size]
         item = self.beet_item_from_inode(fh)
-        data = b''
-        if off <= self.header_cache['header_len']:
-            data += self.header_cache['header'][off:off + size]
-            if off + size > self.header_cache['header_len']:
-                size = size - (self.header_cache['header_len'] - off) # overlap into audio frames
-                off = self.header_cache['header_len']
-            else:
-                return data
-        beetfs_logger.debug('data from {}', item.path)
-        with open(item.path, 'rb') as bfile:
-            data_off = off - self.header_cache['header_len'] + self.header_cache['data_start']
-            bfile.seek(data_off)
-            data += bfile.read(size)
+        info, header = self.header_for(item, need_header=True)
+        data = header[off:off + size]
+        if off + size > info['header_len']: # overlap into audio frames
+            beetfs_logger.debug('data from {}', item.path)
+            with open(item.path, 'rb') as bfile:
+                bfile.seek(info['data_start'] + max(off - info['header_len'], 0))
+                data += bfile.read(size - len(data))
         return data
 
     async def release(self, fh):
         """FUSE API implementation for 'release file descriptor'"""
         beetfs_logger.debug('release(self, {})', fh)
-        # we use read() after release() for some reason, so don't actually drop the cache
-        # self.header_cache = {'modified': 0, 'header': None, 'beet_id': 0, 'header_len': 0}
 
     async def flush(self, fh):
         """FUSE API implementation for 'flush to file'"""
