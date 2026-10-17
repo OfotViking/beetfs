@@ -9,15 +9,18 @@ import logging
 import os
 import sqlite3
 import stat
+import tempfile
+import time
 import trio
 
 import pyfuse3
 from mediafile import MediaFile
 
 from beets import config
+from beets.library import Album
 from beets.plugins import BeetsPlugin as beetsplugin
 from beets.ui import Subcommand as subcommand
-from beets.util import sanitize_path
+from beets.util import bytestring_path, normpath, sanitize_path
 
 beetfs_logger = logging.getLogger('beets')
 
@@ -36,6 +39,52 @@ HEADER_CACHE_SIZE = 32
 
 # how many directories' cover art to keep in memory
 ALBUM_ART_CACHE_SIZE = 64
+
+# how long found (or missing) cover art is trusted before looking again, so art
+# fetched while mounted shows up without a remount
+ALBUM_ART_RECHECK_SECONDS = 300
+
+def is_within(path, directory):
+    """whether path is directory or inside it"""
+    path, directory = os.path.abspath(path), os.path.abspath(directory)
+    return os.path.commonpath([path, directory]) == directory
+
+def redirect_album_art(art_dir):
+    """makes beets keep album art in art_dir, named by album id, instead of in the
+    album's own directory next to the music.
+
+    beets has no setting for this: art_filename is always joined onto the album
+    directory, and a leading '/' is sanitized away. That makes fetchart unusable
+    when the music must stay untouched (read-only storage, seeded torrents).
+    Album.art_destination and Album.set_art are wrapped instead; this affects
+    every beets command run with the beetfs plugin and art_dir configured.
+    """
+    art_dir = normpath(art_dir)
+    os.makedirs(art_dir, exist_ok=True)
+    original_set_art = getattr(Album, 'beetfs_original_set_art', Album.set_art)
+    # where beets puts downloads (beets.util.get_module_tempdir), e.g. fetchart's
+    temp_dir = os.path.join(bytestring_path(tempfile.gettempdir()), b'beets')
+
+    def art_destination(album, image, item_dir=None): # pylint: disable=unused-argument
+        ext = os.path.splitext(bytestring_path(image))[1].lower()
+        return os.path.join(art_dir, str(album.id).encode() + ext)
+
+    def set_art(album, path, copy=True):
+        path = bytestring_path(path)
+        # fetchart moves the image into place. Only let it move its own downloads;
+        # anything else (e.g. a cover.jpg found next to the music) is copied so the
+        # music directories are never modified.
+        if not copy and not is_within(path, temp_dir):
+            copy = True
+        # beets deletes the album's previous art file first; never let that be a
+        # file in a music directory (art set before art_dir was configured)
+        if album.artpath and not is_within(bytestring_path(album.artpath), art_dir):
+            album.artpath = None
+        return original_set_art(album, path, copy)
+
+    Album.beetfs_original_set_art = original_set_art
+    Album.art_destination = art_destination
+    Album.set_art = set_art
 
 # Disk and beets-database work runs in worker threads so one slow request (a header
 # build, a disk spinning up) doesn't hold up every other request, e.g. a playing
@@ -90,6 +139,10 @@ class Beetfs(beetsplugin):
 
     def __init__(self):
         super().__init__()
+        self.config.add({'art_dir': None})
+        art_dir = self.config['art_dir'].get()
+        if art_dir:
+            redirect_album_art(art_dir)
         self.mount_command = subcommand('mount', help='mount a beets filesystem')
         self.mount_command.parser.set_usage(
             '%prog mount [mountpoint] [options]'
@@ -150,10 +203,11 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         self.header_info = {}
         # keyed by item id, least recently used first
         self.header_data = OrderedDict()
-        # keyed by directory inode, least recently used first; holds image data,
-        # so it is bounded. Directories without art are remembered separately.
+        # keyed by directory inode, least recently used first: (time found, art).
+        # Holds image data, so it is bounded. Directories without art are
+        # remembered separately: inode -> time checked.
         self.album_art_cache = OrderedDict()
-        self.no_album_art = set()
+        self.no_album_art = {}
         self.metadata_limiter = trio.CapacityLimiter(METADATA_THREADS)
 
     async def in_thread(self, func, *args):
@@ -222,22 +276,35 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                                   'adding $disc and %aunique{{}} to beetfs.path_format', collisions)
         beetfs_logger.info("Done.")
 
+    @staticmethod
+    def art_from_file(path):
+        """reads an image file as album art, or returns None if it can't be read"""
+        try:
+            with open(path, 'rb') as art_file:
+                data = art_file.read()
+            mtime_ns = os.stat(path).st_mtime_ns
+        except OSError as e:
+            beetfs_logger.debug('error reading cover file {}: {}', path, e)
+            return None
+        ext = os.path.splitext(os.fsdecode(path))[1].lower().replace('jpeg', 'jpg')
+        return {'name': 'cover' + ext, 'data': data, 'mtime_ns': mtime_ns}
+
     def art_from_cover_file(self, source_dir):
         """looks for a cover art file next to the source audio files"""
         for cover_name in COVER_FILE_NAMES:
             cover_path = os.path.join(source_dir, cover_name)
-            if not os.path.exists(cover_path):
-                continue
-            try:
-                with open(cover_path, 'rb') as cover_file:
-                    data = cover_file.read()
-            except OSError as e:
-                beetfs_logger.debug('error reading cover file {}: {}', cover_path, e)
-                continue
-            ext = os.path.splitext(cover_name)[1].lower().replace('jpeg', 'jpg')
-            return {'name': 'cover' + ext, 'data': data,
-                    'mtime_ns': int(os.path.getmtime(cover_path) * 1e9)}
+            if os.path.exists(cover_path):
+                art = self.art_from_file(cover_path)
+                if art:
+                    return art
         return None
+
+    def art_from_beets(self, item):
+        """the art beets has for item's album (album.artpath), e.g. from fetchart"""
+        album = item.get_album() # None for singletons
+        if album is None or not album.artpath:
+            return None
+        return self.art_from_file(album.artpath)
 
     def art_from_embedded(self, item):
         """extracts art embedded in an audio file"""
@@ -258,7 +325,8 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         items = [item for item in items if item is not None]
         art = None
         if items:
-            art = self.art_from_cover_file(os.path.dirname(os.fsdecode(items[0].path)))
+            art = (self.art_from_beets(items[0])
+                   or self.art_from_cover_file(os.path.dirname(os.fsdecode(items[0].path))))
         if art is None:
             for item in items:
                 art = self.art_from_embedded(item)
@@ -268,11 +336,15 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
 
     async def find_album_art(self, dir_inode):
         """finds cover art for a directory that directly contains items, cached per inode"""
-        if dir_inode in self.no_album_art:
+        now = time.monotonic()
+        checked = self.no_album_art.get(dir_inode)
+        if checked is not None and now - checked < ALBUM_ART_RECHECK_SECONDS:
             return None
         if dir_inode in self.album_art_cache:
-            self.album_art_cache.move_to_end(dir_inode)
-            return self.album_art_cache[dir_inode]
+            found, art = self.album_art_cache[dir_inode]
+            if now - found < ALBUM_ART_RECHECK_SECONDS:
+                self.album_art_cache.move_to_end(dir_inode)
+                return art
         art = None
         rows = self.inode_query(f'SELECT {self.columns} FROM inodes WHERE inode = ?', (dir_inode, ))
         result = [x for x in rows[0] if x != ''] if rows else []
@@ -282,9 +354,12 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             rows = self.inode_query(query, tuple(result + ['']))
             art = await self.in_metadata_thread(self.load_album_art, [row[0] for row in rows])
         if art is None:
-            self.no_album_art.add(dir_inode)
+            self.no_album_art[dir_inode] = now
+            self.album_art_cache.pop(dir_inode, None)
         else:
-            self.album_art_cache[dir_inode] = art
+            self.no_album_art.pop(dir_inode, None)
+            self.album_art_cache[dir_inode] = (now, art)
+            self.album_art_cache.move_to_end(dir_inode)
             while len(self.album_art_cache) > ALBUM_ART_CACHE_SIZE:
                 self.album_art_cache.popitem(last=False)
         return art

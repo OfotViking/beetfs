@@ -26,6 +26,25 @@ beetfs:
         /home/foo/beets/music: soundtrack:0
 ```
 
+## Album art
+
+Each album directory in the mount gets a `cover.jpg` (or `.png`), taken from the first of:
+1. the art beets has for the album (`artpath`, e.g. from the `fetchart` plugin)
+2. a cover file next to the music (`cover`, `folder`, `front` or `album` `.jpg`/`.jpeg`/`.png`)
+3. art embedded in one of the album's files
+
+Changes show up within five minutes, without remounting.
+
+beets normally saves fetched art next to the music, which fails if the music is read-only and modifies it if it isn't (e.g. when seeding the files). Set `art_dir` to keep beets' album art in a separate directory instead:
+```
+beetfs:
+    art_dir: ~/.local/share/beets/art
+plugins: beetfs fetchart
+fetchart:
+    auto: yes
+```
+Art is stored there as `<album id>.jpg`. This applies to every beets command while the beetfs plugin is enabled. An image that already sits next to the music (found by fetchart's `filesystem` source) is copied, never moved, and beets won't delete art files in the music directories when replacing art. Don't use `embedart`: it writes the art into the music files.
+
 ## Install
 
 To use beetfs, do any of:
