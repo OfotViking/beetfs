@@ -8,6 +8,12 @@ beetfs:
     path_format: %first{$albumartist}/$album ($year)/$track $title
 ```
 
+Every track needs its own path. If two tracks produce the same path (two editions of an album, or two discs that both start with "01 Intro"), the later one is served with its beets id appended, e.g. `01 Intro [1207].flac`, and a warning is logged at mount time. To get clean names instead, make the format unique the way beets' own default paths do:
+```
+beetfs:
+    path_format: '%first{$albumartist}/$album%aunique{} ($year)/%if{$multidisc,$disc-}$track $title'
+```
+
 To mount the filsystem, simply give the mountpoint as an argument to `beet mount`, e.g. `beet mount ~/Music/beetfs`. A beets query can optionally be passed with `-q` to filter the database, e.g. `beet mount -q 'soundtrack:1 ~/Music/Soundtracks`
 
 One or more mountpoints can be specified in the config file with beets queries and will be mounted with just `beet mount`:
