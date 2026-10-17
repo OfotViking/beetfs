@@ -47,9 +47,10 @@ Art is stored there as `<album id>.jpg`. This applies to every beets command whi
 
 ## Install
 
-To use beetfs, do any of:
-* copy `beetfs.py` directly into your `beetsplug` directory
-* install it from [PyPi](https://pypi.org/project/beets-beetfs/) with `pip`: `pip install beets-beetfs`
-* install it with your package manager (a PKGBUILD for Arch users can be found [here](https://github.com/Abbotta4/beets-beetfs))
+Install this fork into the same Python environment as beets. With beets installed through pipx:
+```
+pipx inject --force beets git+https://github.com/OfotViking/beetfs
+```
+or with pip: `pip install git+https://github.com/OfotViking/beetfs`. (The `beets-beetfs` package on PyPI is the upstream version, without this fork's changes.) pyfuse3 needs the libfuse3 headers to build (`libfuse3-dev`/`fuse3-devel`) and the fuse3 runtime to mount.
 
-and configure it by adding the aforementioned config option to your `config.yaml`. beetfs depends on [pyfuse3](https://github.com/libfuse/pyfuse3), so be sure to install it with `pip` or your distro's package manager.
+Then add `beetfs` to `plugins` in your `config.yaml` along with the options above. To check which copy beets loads: `beet config -p` shows your config, and `python -c "import beetsplug.beetfs as b; print(b.__file__)"` (run with beets' Python, e.g. `~/.local/pipx/venvs/beets/bin/python`) shows the plugin file.
