@@ -8,6 +8,12 @@ beetfs:
     path_format: %first{$albumartist}/$album ($year)/$track $title
 ```
 
+Every track needs its own path. If two tracks produce the same path (two editions of an album, or two discs that both start with "01 Intro"), the later one is served with its beets id appended, e.g. `01 Intro [1207].flac`, and a warning is logged at mount time. To get clean names instead, make the format unique the way beets' own default paths do:
+```
+beetfs:
+    path_format: '%first{$albumartist}/$album%aunique{} ($year)/%if{$multidisc,$disc-}$track $title'
+```
+
 To mount the filsystem, simply give the mountpoint as an argument to `beet mount`, e.g. `beet mount ~/Music/beetfs`. A beets query can optionally be passed with `-q` to filter the database, e.g. `beet mount -q 'soundtrack:1 ~/Music/Soundtracks`
 
 One or more mountpoints can be specified in the config file with beets queries and will be mounted with just `beet mount`:
@@ -19,6 +25,25 @@ beetfs:
         /home/foo/beets/soundtracks: soundtrack:1
         /home/foo/beets/music: soundtrack:0
 ```
+
+## Album art
+
+Each album directory in the mount gets a `cover.jpg` (or `.png`), taken from the first of:
+1. the art beets has for the album (`artpath`, e.g. from the `fetchart` plugin)
+2. a cover file next to the music (`cover`, `folder`, `front` or `album` `.jpg`/`.jpeg`/`.png`)
+3. art embedded in one of the album's files
+
+Changes show up within five minutes, without remounting.
+
+beets normally saves fetched art next to the music, which fails if the music is read-only and modifies it if it isn't (e.g. when seeding the files). Set `art_dir` to keep beets' album art in a separate directory instead:
+```
+beetfs:
+    art_dir: ~/.local/share/beets/art
+plugins: beetfs fetchart
+fetchart:
+    auto: yes
+```
+Art is stored there as `<album id>.jpg`. This applies to every beets command while the beetfs plugin is enabled. An image that already sits next to the music (found by fetchart's `filesystem` source) is copied, never moved, and beets won't delete art files in the music directories when replacing art. Don't use `embedart`: it writes the art into the music files.
 
 ## Install
 
