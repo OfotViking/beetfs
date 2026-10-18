@@ -2,7 +2,25 @@
 
 beetfs mounts a FUSE that provides all your music with the desired tags and metadata applied to the files without touching the actual files underneath.
 
-beetfs takes a config option for building the directory structure of your beets filesystem. The format is the same that is used in `paths`:
+## Directory structure
+
+The directory tree of the mount is built from path formats laid out exactly like beets' own [`paths`](https://beets.readthedocs.io/en/stable/reference/config.html#path-format-configuration):
+```
+beetfs:
+    paths:
+        default: $albumartist/$album%aunique{} ($year)/%if{$multidisc,$disc}/$track $title
+        singleton: Singletons/$artist - $title
+        comp: Compilations/$album%aunique{}/$track $title
+        albumtype:soundtrack: Soundtracks/$album/$track $title
+```
+Each track goes where the first format whose query it matches puts it: `singleton` matches tracks not in an album, `comp` compilations, any other key is a beets query (here `albumtype:soundtrack`), and `default` takes the rest. Tracks can sit at different depths, and as in beets, an empty directory level is left out. `$multidisc` is not a beets field, so the format above needs it defined with the `inline` plugin; it then only adds a disc directory for albums with more than one disc:
+```
+plugins: beetfs inline
+item_fields:
+    multidisc: 1 if disctotal > 1 else 0
+```
+
+Without `beetfs.paths`, the mount uses beets' own `paths`. `path_format: <format>` is a shorthand for `paths` with only a `default`:
 ```
 beetfs:
     path_format: %first{$albumartist}/$album ($year)/$track $title
@@ -13,6 +31,8 @@ Every track needs its own path. If two tracks produce the same path (two edition
 beetfs:
     path_format: '%first{$albumartist}/$album%aunique{} ($year)/%if{$multidisc,$disc-}$track $title'
 ```
+
+## Mounting
 
 To mount the filesystem, simply give the mountpoint as an argument to `beet mount`, e.g. `beet mount ~/Music/beetfs`. A beets query can optionally be passed with `-q` to filter the database, e.g. `beet mount -q 'soundtrack:1' ~/Music/Soundtracks`
 
@@ -109,7 +129,7 @@ Run `sudo systemctl daemon-reload` after editing, if `systemctl edit` didn't alr
 
 ## Album art
 
-Each album directory in the mount gets a `cover.jpg` (or `.png`), taken from the first of:
+Each directory holding an album's tracks (or a single singleton) gets a `cover.jpg` (or `.png`), taken from the first of:
 1. the art beets has for the album (`artpath`, e.g. from the `fetchart` plugin)
 2. a cover file next to the music (`cover`, `folder`, `front` or `album` `.jpg`/`.jpeg`/`.png`)
 3. art embedded in one of the album's files

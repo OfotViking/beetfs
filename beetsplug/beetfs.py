@@ -17,9 +17,9 @@ import pyfuse3
 from mediafile import MediaFile
 
 from beets import config
-from beets.library import Album
+from beets.library import Album, Item, parse_query_string
 from beets.plugins import BeetsPlugin as beetsplugin
-from beets.ui import Subcommand as subcommand
+from beets.ui import Subcommand as subcommand, UserError
 from beets.util import bytestring_path, normpath, sanitize_path
 
 beetfs_logger = logging.getLogger('beets')
@@ -27,6 +27,11 @@ beetfs_logger = logging.getLogger('beets')
 # bit flag marking synthetic album-art inodes; real inodes come from the
 # sqlite table and stay far below this
 ALBUM_ART_INODE_FLAG = 1 << 40
+
+ROOT_INODE = 1
+
+# keys of a paths section that stand for a query, as in beets' own paths
+PATH_FORMAT_QUERIES = {'singleton': 'singleton:true', 'comp': 'comp:true'}
 
 COVER_FILE_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png',
                     'folder.jpg', 'folder.jpeg', 'folder.png',
@@ -122,15 +127,29 @@ def fuse_handler(func):
             raise pyfuse3.FUSEError(errno.EIO) from e
     return wrapper
 
-def get_path_format():
-    """fetches the path format from config else gives default value"""
-    if 'beetfs' in config:
-        return config['beetfs']['path_format'].get().split('/')
-    return config['paths']['default'].get().split('/')
+def get_path_formats():
+    """the path formats the tree is built from, as (query, format) pairs in order of
+    precedence; the last one is the default format, with query None.
 
-def quote_ident(name):
-    """quotes an SQL identifier such as a path format column"""
-    return '"' + name.replace('"', '""') + '"'
+    beetfs.paths is laid out like beets' own paths, which are used when it isn't set.
+    beetfs.path_format is shorthand for a beetfs.paths with only a default.
+    """
+    if config['beetfs']['paths'].exists():
+        view = config['beetfs']['paths']
+    elif config['beetfs']['path_format'].exists():
+        return [(None, config['beetfs']['path_format'].as_str())]
+    else:
+        view = config['paths']
+    formats, default = [], None
+    for key, path_format in view.items():
+        if key == 'default':
+            default = path_format.as_str()
+        else:
+            query, _ = parse_query_string(PATH_FORMAT_QUERIES.get(key, key), Item)
+            formats.append((query, path_format.as_str()))
+    if default is None:
+        raise UserError(f'{view.name} has no default path format')
+    return formats + [(None, default)]
 
 class Beetfs(beetsplugin):
     """plugin class for adding beetfs functionality to beets"""
@@ -171,6 +190,7 @@ class Beetfs(beetsplugin):
                 self.mount_command.parser.print_usage()
                 return
             mountpoints[args[0]] = opts.query
+        path_formats = get_path_formats()
         fuse_options = set(pyfuse3.default_options)
         fuse_options.add('fsname=beetfs')
         fuse_options.add('allow_other')
@@ -181,7 +201,7 @@ class Beetfs(beetsplugin):
             pid = os.fork()
             if pid == 0:
                 try:
-                    beetfs_operations = Operations(lib, mount, query)
+                    beetfs_operations = Operations(lib, mount, query, path_formats)
                     pyfuse3.init(beetfs_operations, mount, fuse_options)
                     trio.run(pyfuse3.main)
                 except Exception as e:
@@ -193,11 +213,10 @@ class Beetfs(beetsplugin):
 
 class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attributes
     """class providing FUSE operations read, write, open, etc."""
-    def __init__(self, library, mountpoint, query):
+    def __init__(self, library, mountpoint, query, path_formats):
         super().__init__()
         self.library = library
-        self.path_format = get_path_format()
-        self.columns = ', '.join([quote_ident(x) for x in self.path_format])
+        self.path_formats = path_formats
         # each mount keeps its inode table in its own in-memory database so that
         # building it never touches (or write-locks) the beets library.db
         self.inode_db = sqlite3.connect(':memory:')
@@ -226,57 +245,74 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         beetfs_logger.debug('{} {}', query, args)
         return self.inode_db.execute(query, args).fetchall()
 
+    def item_path(self, item):
+        """the path components item is served at (the last one without extension),
+        from the first path format whose query item matches"""
+        path_format = next(t for q, t in self.path_formats if q is None or q.match(item))
+        # for_path replaces any / within a field value, so only the format's own / split
+        path = item.evaluate_template(path_format, True)
+        components = [sanitize_path(x, self.library.replacements) for x in path.split('/')]
+        # as in beets, an empty component is left out, so %if{$multidisc,$disc}/
+        # only adds a directory level for albums with more than one disc
+        return [x for x in components if x] or ['_']
+
+    def add_entry(self, parent, name, item, ext=None):
+        """adds a directory, or with ext the file for item, to the inode table.
+
+        If another entry already has the name (e.g. a second edition of an album,
+        or two discs that both have a "01 Intro"), both are kept, telling them apart
+        by the beets id, which is stable across remounts. Returns (inode, name used).
+        """
+        is_file = ext is not None
+        values = (item.id if is_file else None, item.album_id if is_file else None, item.added)
+        insert = 'INSERT INTO inodes (parent, name, item_id, album_id, item_added) VALUES (?, ?, ?, ?, ?)'
+        try:
+            cursor = self.inode_db.execute(insert, (parent, name + (ext or ''), *values))
+        except sqlite3.IntegrityError:
+            name += f' [{item.id}]'
+            cursor = self.inode_db.execute(insert, (parent, name + (ext or ''), *values))
+        return cursor.lastrowid, name
+
     def build_inode_table(self, mountpoint, query):
         """creates the inodes table from the items matching query"""
         beetfs_logger.info("Building inode tree for {}...", mountpoint)
-        column_defs = ', '.join([f'{quote_ident(x)} TEXT' for x in self.path_format])
-        insert_item = f'''INSERT INTO inodes ({self.columns}, item_id, item_added)
-                          VALUES ({', '.join(['?'] * (len(self.path_format) + 2))})'''
-        # directories are shared by many items: inserting an existing one just
-        # updates its timestamp
-        insert = insert_item + f''' ON CONFLICT ({self.columns})
-                     DO UPDATE SET item_added = MAX(excluded.item_added, item_added)'''
         collisions = 0
         with self.inode_db:
-            self.inode_db.execute(f'''CREATE TABLE inodes (
-                                          inode INTEGER PRIMARY KEY,
-                                          {column_defs},
-                                          item_id INTEGER,
-                                          item_added REAL DEFAULT 0,
-                                          UNIQUE ({self.columns})
-                                      );''')
-            # insert a blank entry for the root inode "1"
-            # use '' instead of NULL to enable SQL UNIQUE
-            self.inode_db.execute(insert, [''] * len(self.path_format) + ['', 0])
+            # item_id is NULL for a directory; album_id is kept so a directory of
+            # tracks from different albums (e.g. singletons) gets no cover art
+            self.inode_db.execute('''CREATE TABLE inodes (
+                                         inode INTEGER PRIMARY KEY,
+                                         parent INTEGER,
+                                         name TEXT,
+                                         item_id INTEGER,
+                                         album_id INTEGER,
+                                         item_added REAL DEFAULT 0,
+                                         UNIQUE (parent, name)
+                                     );''')
+            self.inode_db.execute("INSERT INTO inodes (inode, parent, name) VALUES (?, 0, '')",
+                                  (ROOT_INODE, ))
+            dirs = {} # (parent inode, name) -> inode
+            dir_added = {ROOT_INODE: 0} # inode -> newest item_added in it
             for item in self.library.items(query=query):
-                # replace / with _ for unix path sanity
-                components = [
-                    # an empty component would make the row look like its parent directory
-                    sanitize_path(item.evaluate_template(x, True), self.library.replacements) or '_'
-                    for x in self.path_format
-                ]
-                for depth in range(1, len(components)):
-                    values = components[:depth] + [''] * (len(components) - depth)
-                    values += ['', item.added]
-                    self.inode_db.execute(insert, values)
-                try:
-                    self.inode_db.execute(insert_item, components + [item.id, item.added])
-                except sqlite3.IntegrityError:
-                    # another item already has this path (e.g. a second edition of an
-                    # album, or two discs that both have a "01 Intro"). Keep both,
-                    # telling them apart by the beets id, which is stable across remounts.
+                *dir_names, name = self.item_path(item)
+                parent = ROOT_INODE
+                dir_added[parent] = max(dir_added[parent], item.added)
+                for dir_name in dir_names:
+                    if (parent, dir_name) not in dirs:
+                        dirs[(parent, dir_name)], _ = self.add_entry(parent, dir_name, item)
+                    parent = dirs[(parent, dir_name)]
+                    dir_added[parent] = max(dir_added.get(parent, 0), item.added)
+                _, served_name = self.add_entry(parent, name, item, f'.{item.format.lower()}')
+                if served_name != name:
                     collisions += 1
-                    original = '/'.join(components)
-                    components[-1] += f' [{item.id}]'
-                    self.inode_db.execute(insert_item, components + [item.id, item.added])
                     beetfs_logger.warning('beetfs: {} is already taken, serving item {} as {}',
-                                          original, item.id, '/'.join(components))
-            # update root inode
-            self.inode_db.execute('''UPDATE inodes SET item_added = (SELECT MAX(item_added)
-                                     FROM inodes WHERE inode != 1) WHERE inode = 1;''')
+                                          '/'.join(dir_names + [name]), item.id,
+                                          '/'.join(dir_names + [served_name]))
+            self.inode_db.executemany('UPDATE inodes SET item_added = ? WHERE inode = ?',
+                                      [(added, inode) for inode, added in dir_added.items()])
         if collisions:
             beetfs_logger.warning('beetfs: {} items had the same path as another item; consider '
-                                  'adding $disc and %aunique{{}} to beetfs.path_format', collisions)
+                                  'adding $disc and %aunique{{}} to the beetfs path formats', collisions)
         beetfs_logger.info("Done.")
 
     @staticmethod
@@ -349,12 +385,11 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                 self.album_art_cache.move_to_end(dir_inode)
                 return art
         art = None
-        rows = self.inode_query(f'SELECT {self.columns} FROM inodes WHERE inode = ?', (dir_inode, ))
-        result = [x for x in rows[0] if x != ''] if rows else []
-        if rows and len(result) == len(self.path_format) - 1: # directory of items
-            where_clause = ' AND '.join([f'{quote_ident(x)} = ?' for x in self.path_format[:len(result)]])
-            query = f'SELECT item_id FROM inodes WHERE {where_clause} AND item_id != ?'
-            rows = self.inode_query(query, tuple(result + ['']))
+        rows = self.inode_query('''SELECT item_id, album_id FROM inodes
+                                   WHERE parent = ? AND item_id IS NOT NULL''', (dir_inode, ))
+        # only a directory of one album's tracks, or of a single singleton
+        albums = {album_id or ('singleton', item_id) for item_id, album_id in rows}
+        if len(albums) == 1:
             art = await self.in_metadata_thread(self.load_album_art, [row[0] for row in rows])
         if art is None:
             self.no_album_art[dir_inode] = now
@@ -511,17 +546,18 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             return await self.album_art_getattr(inode)
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
-        rows = self.inode_query(f'SELECT {self.columns}, item_added FROM inodes WHERE inode = ?', (inode, ))
+        rows = self.inode_query('SELECT item_id, item_added FROM inodes WHERE inode = ?', (inode, ))
         if not rows:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        if len([x for x in rows[0][:-1] if x != '']) < len(self.path_format): # dir
+        item_id, item_added = rows[0]
+        if item_id is None: # dir
             entry.st_mode = stat.S_IFDIR | 0o555
             entry.st_nlink = 2
             # these next entries should be more meaningful
             entry.st_size = 4096
             entry.st_atime_ns = 0
             entry.st_ctime_ns = 0
-            entry.st_mtime_ns = int(float(rows[0][-1]) * 1e9)
+            entry.st_mtime_ns = int(float(item_added) * 1e9)
         else: # file
             item = await self.beet_item_from_inode(inode)
             info, _, source_stat = await self.header_for(item)
@@ -542,22 +578,15 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         """FUSE API implementation for 'lookup'"""
         beetfs_logger.debug('lookup(self, {}, {}, {})', parent_inode, name, ctx)
         name = os.fsdecode(name)
-        rows = self.inode_query(f'SELECT {self.columns} FROM inodes WHERE inode = ?', (parent_inode, ))
-        if not rows:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-        result = [x for x in rows[0] if x != '']
-        depth = len(result)
-        if depth == len(self.path_format) - 1: # children are beet items
+        rows = self.inode_query('SELECT inode FROM inodes WHERE parent = ? AND name = ?',
+                                (parent_inode, name))
+        if rows:
+            return await self.getattr(rows[0][0])
+        if name.startswith('cover.'):
             art = await self.find_album_art(parent_inode)
             if art and name == art['name']:
                 return await self.album_art_getattr(parent_inode | ALBUM_ART_INODE_FLAG)
-            name = os.path.splitext(name)[0] # stored names have no extension
-        values = result + [name] + [''] * (len(self.path_format) - depth - 1)
-        where_clause = ' AND '.join([f'{quote_ident(x)} = ?' for x in self.path_format])
-        rows = self.inode_query(f'SELECT inode FROM inodes WHERE {where_clause}', tuple(values))
-        if not rows:
-            raise pyfuse3.FUSEError(errno.ENOENT)
-        return await self.getattr(rows[0][0])
+        raise pyfuse3.FUSEError(errno.ENOENT)
 
     @fuse_handler
     async def opendir(self, inode, ctx):
@@ -573,33 +602,20 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
     async def readdir(self, fh, start_id, token):
         """FUSE API implementation for 'read directory'"""
         beetfs_logger.debug('readdir(self, {}, {}, {})', fh, start_id, token)
-        rows = self.inode_query(f'SELECT {self.columns} FROM inodes WHERE inode = ?', (fh, ))
-        result = [x for x in rows[0] if x != '']
-        depth = len(result)
-        fixed_columns = self.path_format[:depth] + self.path_format[depth+1:]
-        col = quote_ident(self.path_format[depth])
-        where_clause = ' AND '.join([f'{quote_ident(x)} = ?' for x in fixed_columns] + [f'{col} != ?'])
-        query = f'SELECT inode, item_id, {col} FROM inodes WHERE {where_clause}'
-        values = result + [''] * (len(self.path_format) - depth - 1) + ['']
-        rows = self.inode_query(query, tuple(values))
-        for idx, row in enumerate(rows):
+        rows = self.inode_query('SELECT inode, name FROM inodes WHERE parent = ? ORDER BY inode', (fh, ))
+        for idx, (inode, name) in enumerate(rows):
             if idx < start_id:
                 continue
             try:
-                entry = await self.getattr(row[0])
+                # also fails for an item removed from the library since the mount was built
+                entry = await self.getattr(inode)
                 # TODO() store the result here and manage lookup count
-                reply_name = row[2]
-                if depth == len(self.path_format)-1: # beet item
-                    item = await self.in_thread(self.library.get_item, row[1])
-                    if item is None: # removed from the library since the mount was built
-                        continue
-                    reply_name += f'.{item.format.lower()}'
             except pyfuse3.FUSEError:
                 continue # leave out the one broken entry rather than failing the whole listing
-            if not pyfuse3.readdir_reply(token, bytes(reply_name, encoding='utf-8'), entry, idx + 1):
+            if not pyfuse3.readdir_reply(token, os.fsencode(name), entry, idx + 1):
                 return # token buffer full
         art_idx = len(rows)
-        if depth == len(self.path_format)-1 and start_id <= art_idx: # directory of beet items
+        if start_id <= art_idx:
             art = await self.find_album_art(fh)
             if art:
                 entry = await self.album_art_getattr(fh | ALBUM_ART_INODE_FLAG)
