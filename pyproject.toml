@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beets-beetfs"
-version = "0.10.0"
+version = "0.11.0"
 authors = [
   { name="Drew Abbott", email="abbotta4@gmail.com" },
 ]
