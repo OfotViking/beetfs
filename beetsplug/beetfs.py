@@ -174,6 +174,9 @@ class Beetfs(beetsplugin):
         fuse_options = set(pyfuse3.default_options)
         fuse_options.add('fsname=beetfs')
         fuse_options.add('allow_other')
+        # the kernel then rejects every write (open for writing, setattr, create,
+        # unlink, rename, ...) with EROFS before it reaches us
+        fuse_options.add('ro')
         for mount, query in mountpoints.items():
             pid = os.fork()
             if pid == 0:
@@ -371,7 +374,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             raise pyfuse3.FUSEError(errno.ENOENT)
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
-        entry.st_mode = stat.S_IFREG | 0o644
+        entry.st_mode = stat.S_IFREG | 0o444
         entry.st_nlink = 1
         entry.st_size = len(art['data'])
         entry.st_atime_ns = art['mtime_ns']
@@ -512,7 +515,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         if not rows:
             raise pyfuse3.FUSEError(errno.ENOENT)
         if len([x for x in rows[0][:-1] if x != '']) < len(self.path_format): # dir
-            entry.st_mode = stat.S_IFDIR | 0o755
+            entry.st_mode = stat.S_IFDIR | 0o555
             entry.st_nlink = 2
             # these next entries should be more meaningful
             entry.st_size = 4096
@@ -522,7 +525,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         else: # file
             item = await self.beet_item_from_inode(inode)
             info, _, source_stat = await self.header_for(item)
-            entry.st_mode = stat.S_IFREG | 0o644
+            entry.st_mode = stat.S_IFREG | 0o444
             entry.st_nlink = 1
             # the served file is the rewritten header plus the source audio
             entry.st_size = info['size']
@@ -606,8 +609,9 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
     async def open(self, inode, flags, ctx):
         """FUSE API implementation for 'open file'"""
         beetfs_logger.debug('open(self, {}, {}, {})', inode, flags, ctx)
-        if flags & os.O_RDWR or flags & os.O_WRONLY:
-            raise pyfuse3.FUSEError(errno.EACCES)
+        # the ro mount option already stops these; kept in case it is mounted without it
+        if flags & os.O_ACCMODE != os.O_RDONLY or flags & (os.O_TRUNC | os.O_APPEND):
+            raise pyfuse3.FUSEError(errno.EROFS)
         if inode & ALBUM_ART_INODE_FLAG:
             if await self.find_album_art(inode & ~ALBUM_ART_INODE_FLAG) is None:
                 raise pyfuse3.FUSEError(errno.ENOENT)
@@ -664,7 +668,9 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
     async def access(self, inode, mode, ctx):
         """FUSE API implementation for 'check access permissions'"""
         beetfs_logger.debug('access(self, {}, {}, {})', inode, mode, ctx)
-        return not mode & os.W_OK # read-only filesystem
+        if mode & os.W_OK: # read-only filesystem
+            raise pyfuse3.FUSEError(errno.EROFS)
+        return True
 
     @fuse_handler
     async def forget(self, inode_list):
