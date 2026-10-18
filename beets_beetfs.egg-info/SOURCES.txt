@@ -1,0 +1,9 @@
+LICENSE
+README.md
+pyproject.toml
+beets_beetfs.egg-info/PKG-INFO
+beets_beetfs.egg-info/SOURCES.txt
+beets_beetfs.egg-info/dependency_links.txt
+beets_beetfs.egg-info/requires.txt
+beets_beetfs.egg-info/top_level.txt
+beetsplug/beetfs.py

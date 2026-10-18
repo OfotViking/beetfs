@@ -1,0 +1,4 @@
+beets>=2.0
+mediafile
+pyfuse3
+trio

@@ -4,13 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beets-beetfs"
-version = "0.9.1"
+version = "0.10.0"
 authors = [
   { name="Drew Abbott", email="abbotta4@gmail.com" },
 ]
 description = "A beets plugin for mounting a FUSE filesystem of audio items"
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = [
+    "beets>=2.0",
+    "mediafile",
+    "pyfuse3",
+    "trio",
+]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: POSIX :: Linux",
@@ -20,10 +26,13 @@ license = "MIT"
 license-files = ["LICEN[CS]E*"]
 
 [project.urls]
-Homepage = "https://github.com/abbotta4/beetfs"
-Issues = "https://github.com/abbotta4/beetfs/issues"
+Homepage = "https://github.com/OfotViking/beetfs"
+Issues = "https://github.com/OfotViking/beetfs/issues"
+Upstream = "https://github.com/abbotta4/beetfs"
 
 [tool.setuptools.packages.find]
 # All the following settings are optional:
 include = ["beetsplug"]
-namespaces = false  # true by default
+# beetsplug is a namespace package shared with beets and its other plugins,
+# so it has no __init__.py; without this the wheel would contain no plugin
+namespaces = true
