@@ -49,3 +49,33 @@ The podman setup used to find the Samba problem (Debian container with beets, py
 - `beet import` an album and `beet modify` a title, then send SIGHUP.
 - Check that the new album appears, the renamed file has its new name, and the old handles still read.
 - Check that nothing fails 25 s later, after the Windows client caches have expired, without running `close-share`.
+
+## Change a file's mtime when its tags change
+
+A served file's `st_mtime` is the source file's mtime (`getattr`). When beets doesn't write tags to the files (`write: no`, read-only or seeded music), `beet modify` only changes `library.db`. The served file then gets the new tags and possibly a new size, but keeps its old mtime. Media players and indexers that rescan files with a newer mtime (most of them, e.g. Lyrion, Jellyfin, Plex) never pick up the edit, so a full rescan is the only way. The same goes for backup and sync tools that compare mtimes.
+
+### What the mtime should be
+
+Serve `max(source mtime, time the item's served tags last changed)`. Neither beets nor beetfs records the second value:
+
+- Item's `mtime` field: no. beets only updates it when it reads or writes the file, so it stays the same on a database-only `modify`.
+- Flexible attribute set from a beets event: no. The beetfs plugin would set it from `database_change` in whichever `beet` command makes the change. But storing it fires the event again, and the event doesn't say which fields changed, so non-tag changes (e.g. `artpath`) would bump it too. Any change made while the plugin isn't loaded would also be missed.
+- **beetfs's own record:** yes. `source_key` already computes `tags_digest` of exactly the tags that are served. Keep `item_id -> (digest, changed_at)`, and when the digest differs from the stored one, set `changed_at = now`. This catches every change, however it was made.
+
+### Persisting it
+
+That record has to survive remounts, or every file would look changed after each restart. That would mean a full rescan by every player, which is worse than the current behaviour. Keep it in a small SQLite file of beetfs's own, e.g. `beetfs.db` in beets' config directory (`config.config_dir()`), not in `library.db` (see the in-memory inode table for why). With several mounts, each process writes it, so use WAL mode and short transactions, or one file per mountpoint.
+
+- **First run:** there's no record yet, so store the current digests with `changed_at = 0`. Nothing gets newer than its source file until it is actually edited.
+- **When to check:** checking only on `getattr`/`open` means an edit is only noticed when something stats the file. A player scanning by mtime does stat it, so the next scan sees the new mtime. That is enough, and it avoids walking the whole library. A bulk check at mount time, or on reload (see above), could catch edits made while nothing was mounted, but costs a pass over all items.
+- **Serving the new values:** use `changed_at` for `st_mtime`, and for `st_ctime` as well, since metadata changed. Don't set it on the album-art and directory entries, but consider bumping a directory's mtime when one of its files changes. Some scanners only descend into directories whose mtime changed.
+- **Kernel cache:** call `pyfuse3.invalidate_inode` when `changed_at` moves, so the kernel's cached attributes and pages are dropped (the headers changed too).
+- **Pruning:** remove records for items that are gone from the library.
+
+### Testing the mtime
+
+Use the podman harness:
+1. Note a file's mtime over SMB and from `stat` in the container.
+2. Run `beet modify -W title=...` (database only).
+3. Check that the mtime moves forward and the new title is served.
+4. Remount and check that the mtime stays the same as after step 3, and doesn't jump again.
