@@ -30,11 +30,11 @@ beetfs_logger = logging.getLogger('beets')
 # (backup tools, NFS exports, media indexers) don't see the whole library change:
 # a file is its beets item id with ITEM_INODE_FLAG set, a directory a hash of its
 # parent's inode and its name (below ITEM_INODE_FLAG), and a directory's cover art
-# the directory's inode with ALBUM_ART_INODE_FLAG set. All stay below 2**63, as
-# sqlite integers are signed.
+# the directory's inode with ALBUM_ART_INODE_FLAG set. All stay well below 2**53,
+# so tools that hold inodes in a double (Node's fs.stat) still tell them apart.
 ROOT_INODE = 1
-ITEM_INODE_FLAG = 1 << 61
-ALBUM_ART_INODE_FLAG = 1 << 62
+ITEM_INODE_FLAG = 1 << 39
+ALBUM_ART_INODE_FLAG = 1 << 40
 
 # keys of a paths section that stand for a query, as in beets' own paths
 PATH_FORMAT_QUERIES = {'singleton': 'singleton:true', 'comp': 'comp:true'}
@@ -273,7 +273,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         """the inode for a new entry: the file for item, or directory name in parent"""
         if is_file:
             return ITEM_INODE_FLAG | item.id
-        # with 61 bits a collision is rare enough that which directory gets the next
+        # with 39 bits a collision is rare enough that which directory gets the next
         # candidate depending on build order doesn't matter
         for attempt in itertools.count():
             inode = directory_inode(parent, name, attempt)
