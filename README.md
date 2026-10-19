@@ -127,6 +127,15 @@ A service that reads the music from beetfs, such as a music server, should only 
 
 Run `sudo systemctl daemon-reload` after editing, if `systemctl edit` didn't already do it. `systemctl list-dependencies lyrionmusicserver` should now list `beetfs.service`.
 
+### Sharing the mount with Samba
+
+Samba keeps the share's directory, and whatever a client has opened in it, open for as long as the client stays connected. After `systemctl restart beetfs` those still point at the old mount, which is gone: browsing keeps working for a few seconds from caches, then Windows shows errors such as "The parameter is incorrect" or "The directory name is invalid" until it disconnects. To have Samba drop its connections to the share once the new mount is up, add this to the `[Service]` section of `beetfs.service`, below the `ExecStartPost` line that waits for the mount, with `Music` replaced by the share's name:
+```ini
+# make Samba clients reconnect to the new mount; + runs it as root
+ExecStartPost=-+/usr/bin/smbcontrol smbd close-share Music
+```
+Clients reconnect by themselves, and Samba doesn't need restarting. Samba doesn't need to start after beetfs either, as it only looks at the mountpoint when a client connects.
+
 ## Album art
 
 Each directory holding an album's tracks (or a single singleton) gets a `cover.jpg` (or `.png`), taken from the first of:
