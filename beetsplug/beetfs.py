@@ -5,6 +5,7 @@ from io import BytesIO
 import errno
 import functools
 import hashlib
+import itertools
 import logging
 import os
 import sqlite3
@@ -24,11 +25,16 @@ from beets.util import bytestring_path, normpath, sanitize_path
 
 beetfs_logger = logging.getLogger('beets')
 
-# bit flag marking synthetic album-art inodes; real inodes come from the
-# sqlite table and stay far below this
-ALBUM_ART_INODE_FLAG = 1 << 40
-
+# Inode numbers are derived from what an entry is rather than handed out in build
+# order, so they stay the same across remounts and tools that track files by inode
+# (backup tools, NFS exports, media indexers) don't see the whole library change:
+# a file is its beets item id with ITEM_INODE_FLAG set, a directory a hash of its
+# parent's inode and its name (below ITEM_INODE_FLAG), and a directory's cover art
+# the directory's inode with ALBUM_ART_INODE_FLAG set. All stay below 2**63, as
+# sqlite integers are signed.
 ROOT_INODE = 1
+ITEM_INODE_FLAG = 1 << 61
+ALBUM_ART_INODE_FLAG = 1 << 62
 
 # keys of a paths section that stand for a query, as in beets' own paths
 PATH_FORMAT_QUERIES = {'singleton': 'singleton:true', 'comp': 'comp:true'}
@@ -102,6 +108,13 @@ def read_source(path, offset, size):
     with open(path, 'rb') as bfile:
         bfile.seek(offset)
         return bfile.read(size)
+
+def directory_inode(parent, name, attempt=0):
+    """the inode of directory name in parent; a later attempt gives the next candidate,
+    for when that one is taken"""
+    key = f'{parent}\0{name}\0{attempt}'.encode('utf-8', 'surrogateescape')
+    digest = hashlib.blake2b(key, digest_size=8).digest()
+    return int.from_bytes(digest, 'big') & (ITEM_INODE_FLAG - 1)
 
 def tags_digest(tags):
     """a compact fingerprint of an item's tags, used as part of the header cache key"""
@@ -256,6 +269,19 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         # only adds a directory level for albums with more than one disc
         return [x for x in components if x] or ['_']
 
+    def entry_inode(self, parent, name, item, is_file):
+        """the inode for a new entry: the file for item, or directory name in parent"""
+        if is_file:
+            return ITEM_INODE_FLAG | item.id
+        # with 61 bits a collision is rare enough that which directory gets the next
+        # candidate depending on build order doesn't matter
+        for attempt in itertools.count():
+            inode = directory_inode(parent, name, attempt)
+            if inode > ROOT_INODE and not self.inode_db.execute(
+                    'SELECT 1 FROM inodes WHERE inode = ?', (inode, )).fetchone():
+                return inode
+        raise AssertionError('unreachable')
+
     def add_entry(self, parent, name, item, ext=None):
         """adds a directory, or with ext the file for item, to the inode table.
 
@@ -265,13 +291,16 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         """
         is_file = ext is not None
         values = (item.id if is_file else None, item.album_id if is_file else None, item.added)
-        insert = 'INSERT INTO inodes (parent, name, item_id, album_id, item_added) VALUES (?, ?, ?, ?, ?)'
+        insert = '''INSERT INTO inodes (inode, parent, name, item_id, album_id, item_added)
+                    VALUES (?, ?, ?, ?, ?, ?)'''
         try:
-            cursor = self.inode_db.execute(insert, (parent, name + (ext or ''), *values))
+            inode = self.entry_inode(parent, name, item, is_file)
+            self.inode_db.execute(insert, (inode, parent, name + (ext or ''), *values))
         except sqlite3.IntegrityError:
             name += f' [{item.id}]'
-            cursor = self.inode_db.execute(insert, (parent, name + (ext or ''), *values))
-        return cursor.lastrowid, name
+            inode = self.entry_inode(parent, name, item, is_file)
+            self.inode_db.execute(insert, (inode, parent, name + (ext or ''), *values))
+        return inode, name
 
     def build_inode_table(self, mountpoint, query):
         """creates the inodes table from the items matching query"""
@@ -279,9 +308,11 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         collisions = 0
         with self.inode_db:
             # item_id is NULL for a directory; album_id is kept so a directory of
-            # tracks from different albums (e.g. singletons) gets no cover art
+            # tracks from different albums (e.g. singletons) gets no cover art.
+            # The implicit rowid keeps the build order (beets' sort order), which
+            # directories are listed in.
             self.inode_db.execute('''CREATE TABLE inodes (
-                                         inode INTEGER PRIMARY KEY,
+                                         inode INTEGER NOT NULL UNIQUE,
                                          parent INTEGER,
                                          name TEXT,
                                          item_id INTEGER,
@@ -602,7 +633,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
     async def readdir(self, fh, start_id, token):
         """FUSE API implementation for 'read directory'"""
         beetfs_logger.debug('readdir(self, {}, {}, {})', fh, start_id, token)
-        rows = self.inode_query('SELECT inode, name FROM inodes WHERE parent = ? ORDER BY inode', (fh, ))
+        rows = self.inode_query('SELECT inode, name FROM inodes WHERE parent = ? ORDER BY rowid', (fh, ))
         for idx, (inode, name) in enumerate(rows):
             if idx < start_id:
                 continue

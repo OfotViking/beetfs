@@ -58,7 +58,7 @@ If it fails with `Device or resource busy`, something still has a file or direct
 
 Don't stop it by killing the process: that leaves the mountpoint behind, failing with `Transport endpoint is not connected`, until it is unmounted with `fusermount3 -u` as above.
 
-The directory tree is built when the filesystem is mounted, so to see music added to beets since then, unmount and run `beet mount` again.
+The directory tree is built when the filesystem is mounted, so to see music added to beets since then, unmount and run `beet mount` again. Inode numbers come from the beets item ids and the directory paths, so they stay the same across remounts: tools that track files by inode (backup tools, NFS exports) don't see the whole library as changed.
 
 ## Starting at boot
 
