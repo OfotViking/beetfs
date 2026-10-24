@@ -1,54 +1,16 @@
 # TODO
 
-## Pick up library changes without remounting
+## Reloading: what's left
 
-At the moment, the only way to see music imported or changed in beets is to unmount and mount again (`systemctl restart beetfs`). That causes three problems:
+Since 0.13, SIGHUP rebuilds the tree in place (`Operations.reload`), and the README's systemd unit has `ExecReload=`. Still open:
 
-- **Stale handles:** anything holding the mount open keeps pointing at the old mount, which is dead once its process is killed. For example, smbd keeps the share root and every file a client has touched open for the whole session. Samba clients then get errors until they reconnect. The README works around this with `smbcontrol smbd close-share`, but music servers and shells `cd`'d into the mount are affected the same way.
-- **Empty mountpoint:** until the new tree is built, the mountpoint is empty. A service that scans it during that time can drop the music from its own library.
-- **Downtime:** the whole tree is rebuilt while nothing is mounted, so a large library is unavailable for that long.
+- **Automatic reload:** poll the mtime of `library.db` (and `library.db-wal`, if present) every 30–60 s. Rebuild only after it has stopped changing for a while, so a long `beet import` doesn't trigger a rebuild per album. This would make `systemctl reload beetfs` unnecessary after an import.
+- **NFS generation numbers:** beets' `items.id` is `INTEGER PRIMARY KEY` without `AUTOINCREMENT`, so SQLite can hand out the id of the most recently deleted item again, and the same inode is then a different file. The reload invalidates it in the kernel, but for NFS exports, also bump `EntryAttributes.generation` for an inode whose item changed, so that old NFS file handles are rejected instead of reaching the new file.
+- **Load:** a rebuild evaluates every path template again and holds the GIL while doing so, so requests slow down during it. Keep an eye on playback while a large library rebuilds. If it stutters, consider rebuilding in a subprocess and passing the result back as an SQLite file.
+- **Re-reading the config:** a reload keeps the path formats and query loaded at `beet mount` time. Re-reading `config` in place is possible, but plugins such as `inline` register their fields when they load.
+- **Samba directory leases:** Samba 4.22+ lets clients cache listings until it breaks their directory lease, and it doesn't notice a reload. The README turns them off (`smb3 directory leases = no`). Telling Samba instead would need inotify events from the FUSE mount: according to libfuse's docs, `invalidate_entry(parent, name, deleted=inode)` (`notify_delete`) raises `IN_DELETE` for removed and renamed entries (untested), but nothing raises `IN_CREATE` for new ones.
 
-The fix is to rebuild the inode table **inside the running process** and swap it in. The mount never goes away, so open handles stay valid. Since 0.12, inode numbers are derived from the entry instead of the build order (item id for files, hash of parent inode and name for directories), so an entry that hasn't changed keeps its inode across a rebuild.
-
-### Triggering a rebuild
-
-- **SIGHUP** to the mount process. Run a trio task next to `pyfuse3.main` that waits on `trio.open_signal_receiver(signal.SIGHUP)`. `beet mount` forks one child per mountpoint and the parent exits, so systemd's `$MAINPID` is only a guess. Either write a pid file per mountpoint, or use `ExecReload=/usr/bin/pkill -HUP -f 'beet mount'`.
-- **Automatic** (optional, could be added later): poll the mtime of `library.db` (and `library.db-wal`, if present) every 30–60 s. Rebuild only after it has stopped changing for a while, so a long `beet import` doesn't trigger a rebuild per album. This would make `systemctl restart beetfs` unnecessary for new music.
-- Add `ExecReload=` to the README's systemd unit, and change the README's advice from `restart` to `reload`.
-
-### Rebuilding
-
-- Build the new table in a worker thread (`trio.to_thread.run_sync`), so requests keep being served from the old table meanwhile. `build_inode_table` would have to return a new connection instead of writing to `self.inode_db`. The connection must use `check_same_thread=False`, because it is built in one thread and queried from the event loop thread.
-- Swap `self.inode_db` on the event loop thread in a single assignment. Every handler reads the table through `inode_query`, so after the swap they all see the new table.
-- Path formats and queries come from the config loaded at `beet mount` time. A reload does not re-read the beets config, so changes to path formats still need a restart. Re-reading `config` in place is possible, but plugins such as `inline` register their fields when they load.
-- Log how many entries were added, removed and changed, and keep the collision warnings.
-
-### Telling the kernel
-
-The kernel caches lookups (`entry_timeout`) and attributes (`attr_timeout`), and Samba and other clients cache on top of that. After the swap, compare the old and new tables:
-
-- **An entry `(parent, name)` that is gone, or now has a different inode:** call `pyfuse3.invalidate_entry_async(parent, name)`. Don't use the synchronous `invalidate_entry` from inside the event loop, because it can deadlock against a request in progress.
-- **A directory whose children changed:** call `pyfuse3.invalidate_inode(dir)`. This drops its cached listing.
-- **A file whose item changed:** call `pyfuse3.invalidate_inode(inode)`. This drops cached attributes and pages. Tag edits change the header size, and so the file size.
-- Everything else keeps its inode and needs nothing.
-
-### Things to watch out for
-
-- **Item ids can be reused.** beets' `items.id` is `INTEGER PRIMARY KEY` without `AUTOINCREMENT`, so SQLite can hand out the id of the most recently deleted item again. The same inode would then be a different file. The invalidation above covers the kernel. For NFS exports, also bump `EntryAttributes.generation` for an inode whose item changed, so that old NFS file handles are rejected instead of reaching the new file.
-- **Hash collisions:** a directory that lost or won a hash collision can change inode across a rebuild. This is rare, and the invalidation covers it too.
-- **readdir across a swap:** `readdir` reads the rows again on every call and uses the row index as the offset. A listing that spans a swap could skip or repeat entries (see the existing TODO in `readdir`). Snapshot the rows in `opendir`, keyed by a new fh, use them in `readdir`, and drop them in `releasedir`.
-- **Caches:**
-  - `album_art_cache` and `no_album_art` are keyed by directory inode, so they stay correct. Clear `no_album_art` on reload anyway, so new art shows up straight away.
-  - `header_info` and `header_data` are keyed by item id, and their key includes the source mtime and a digest of the tags, so they need nothing. Entries for removed items could be pruned.
-- **Load:** a rebuild evaluates every path template again and holds the GIL while doing so, so requests slow down during it. Audio reads already run in worker threads, but keep an eye on playback while a large library rebuilds. If it stutters, consider rebuilding in a subprocess and passing the result back as an SQLite file.
-
-### Testing
-
-The podman setup used to find the Samba problem (Debian container with beets, pyfuse3 and Samba, shared to Windows with `net use \\127.0.0.1\Music /TCPPORT:4450`) is a good harness:
-- Hold a folder open with a `FileSystemWatcher`.
-- `beet import` an album and `beet modify` a title, then send SIGHUP.
-- Check that the new album appears, the renamed file has its new name, and the old handles still read.
-- Check that nothing fails 25 s later, after the Windows client caches have expired, without running `close-share`.
+Testing used the podman harness (Debian container with beets, pyfuse3 and Samba, shared to Windows with `net use \127.0.0.1\Music /TCPPORT:4450`). Note that `pkill -HUP -f 'beet mount'` inside `sh -c '...'` also matches, and kills, that shell; use `'[b]eet mount'` there.
 
 ## Change a file's mtime when its tags change
 
@@ -69,7 +31,7 @@ That record has to survive remounts, or every file would look changed after each
 - **First run:** there's no record yet, so store the current digests with `changed_at = 0`. Nothing gets newer than its source file until it is actually edited.
 - **When to check:** checking only on `getattr`/`open` means an edit is only noticed when something stats the file. A player scanning by mtime does stat it, so the next scan sees the new mtime. That is enough, and it avoids walking the whole library. A bulk check at mount time, or on reload (see above), could catch edits made while nothing was mounted, but costs a pass over all items.
 - **Serving the new values:** use `changed_at` for `st_mtime`, and for `st_ctime` as well, since metadata changed. Don't set it on the album-art and directory entries, but consider bumping a directory's mtime when one of its files changes. Some scanners only descend into directories whose mtime changed.
-- **Kernel cache:** call `pyfuse3.invalidate_inode` when `changed_at` moves, so the kernel's cached attributes and pages are dropped (the headers changed too).
+- **Kernel cache:** call `invalidate_inodes` (from the reload) when `changed_at` moves, so the kernel's cached attributes and pages are dropped (the headers changed too).
 - **Pruning:** remove records for items that are gone from the library.
 
 ### Testing the mtime

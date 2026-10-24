@@ -8,6 +8,7 @@ import hashlib
 import itertools
 import logging
 import os
+import signal
 import sqlite3
 import stat
 import tempfile
@@ -121,9 +122,46 @@ def directory_inode(parent, name, attempt=0):
     digest = hashlib.blake2b(key, digest_size=8).digest()
     return int.from_bytes(digest, 'big') & (ITEM_INODE_FLAG - 1)
 
+def served_tags(item):
+    """the tags written into the header served for item"""
+    return {k: v for k, v in item.items() if k in item._media_fields}  # pylint: disable=protected-access
+
 def tags_digest(tags):
     """a compact fingerprint of an item's tags, used as part of the header cache key"""
     return hashlib.blake2b(repr(sorted(tags.items())).encode(), digest_size=16).digest()
+
+def table_entries(db):
+    """every entry in an inode table: inode -> (parent, name, item id)"""
+    return {inode: (parent, name, item_id) for inode, parent, name, item_id
+            in db.execute('SELECT inode, parent, name, item_id FROM inodes')}
+
+def diff_tables(old, new):
+    """what changed between two inode tables, as table_entries gives them:
+    stale_entries, the (parent, name) entries that are gone or now lead to another
+    inode; changed_dirs, the directories whose children changed; inodes, every inode
+    in new; and counts of files added, removed and moved."""
+    old_names = {(parent, name): inode for inode, (parent, name, _) in old.items()}
+    new_names = {(parent, name): inode for inode, (parent, name, _) in new.items()}
+    stale = [key for key, inode in old_names.items() if new_names.get(key) != inode]
+    fresh = [key for key, inode in new_names.items() if old_names.get(key) != inode]
+    old_files = {inode for inode, entry in old.items() if entry[2] is not None}
+    new_files = {inode for inode, entry in new.items() if entry[2] is not None}
+    return {'stale_entries': stale,
+            'changed_dirs': {parent for parent, _ in stale + fresh if parent in new},
+            'inodes': set(new),
+            'added': len(new_files - old_files),
+            'removed': len(old_files - new_files),
+            'moved': sum(1 for inode in old_files & new_files if old[inode][:2] != new[inode][:2])}
+
+def invalidate_inodes(inodes):
+    """drops the kernel's cached attributes and data for inodes; blocking, runs in a
+    worker thread"""
+    for inode in inodes:
+        try:
+            pyfuse3.invalidate_inode(inode)
+        except OSError as e:
+            if e.errno != errno.ENOENT: # ENOENT: the kernel has nothing cached for it
+                beetfs_logger.warning('beetfs: invalidating inode {} failed: {}', inode, e)
 
 def fuse_handler(func):
     """turns unexpected exceptions in a FUSE handler into an errno for that one request
@@ -168,6 +206,13 @@ def get_path_formats():
     if default is None:
         raise UserError(f'{view.name} has no default path format')
     return formats + [(None, default)]
+
+async def serve(operations):
+    """serves the mount until it is unmounted, rebuilding its tree on SIGHUP"""
+    async with trio.open_nursery() as nursery:
+        nursery.start_soon(operations.reload_on_sighup)
+        await pyfuse3.main()
+        nursery.cancel_scope.cancel()
 
 class Beetfs(beetsplugin):
     """plugin class for adding beetfs functionality to beets"""
@@ -220,10 +265,13 @@ class Beetfs(beetsplugin):
         for mount, query in mountpoints.items():
             pid = os.fork()
             if pid == 0:
+                # SIGHUP asks for a reload (see serve); until that listens, and after
+                # it stops, one must not kill the mount
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
                 try:
                     beetfs_operations = Operations(lib, mount, query, path_formats)
                     pyfuse3.init(beetfs_operations, mount, fuse_options)
-                    trio.run(pyfuse3.main)
+                    trio.run(serve, beetfs_operations)
                 except Exception as e:
                     print(f'Child failed for {mount}: {e}', flush=True)
                     pyfuse3.close()
@@ -236,11 +284,16 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
     def __init__(self, library, mountpoint, query, path_formats):
         super().__init__()
         self.library = library
+        self.mountpoint = mountpoint
+        self.query = query
         self.path_formats = path_formats
         # each mount keeps its inode table in its own in-memory database so that
-        # building it never touches (or write-locks) the beets library.db
-        self.inode_db = sqlite3.connect(':memory:')
-        self.build_inode_table(mountpoint, query)
+        # building it never touches (or write-locks) the beets library.db. A reload
+        # builds a new one and swaps it in.
+        self.inode_db, self.digests = self.build_inode_table()
+        # open directories: fh -> (inode, rows listed), see opendir
+        self.dir_handles = {}
+        self.dir_fhs = itertools.count(1)
         # keyed by item id: {'key', 'header_len', 'data_start', 'size'}
         self.header_info = {}
         # keyed by item id, least recently used first
@@ -276,21 +329,22 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         # only adds a directory level for albums with more than one disc
         return [x for x in components if x] or ['_']
 
-    def entry_inode(self, parent, name, item, is_file):
-        """the inode for a new entry: the file for item, or directory name in parent"""
+    @staticmethod
+    def entry_inode(db, parent, name, item, is_file):
+        """the inode for a new entry in db: the file for item, or directory name in parent"""
         if is_file:
             return ITEM_INODE_FLAG | item.id
         # with 39 bits a collision is rare enough that which directory gets the next
         # candidate depending on build order doesn't matter
         for attempt in itertools.count():
             inode = directory_inode(parent, name, attempt)
-            if inode > ROOT_INODE and not self.inode_db.execute(
+            if inode > ROOT_INODE and not db.execute(
                     'SELECT 1 FROM inodes WHERE inode = ?', (inode, )).fetchone():
                 return inode
         raise AssertionError('unreachable')
 
-    def add_entry(self, parent, name, item, ext=None):
-        """adds a directory, or with ext the file for item, to the inode table.
+    def add_entry(self, db, parent, name, item, ext=None):
+        """adds a directory, or with ext the file for item, to the inode table in db.
 
         If another entry already has the name (e.g. a second edition of an album,
         or two discs that both have a "01 Intro"), both are kept, telling them apart
@@ -301,24 +355,29 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         insert = '''INSERT INTO inodes (inode, parent, name, item_id, album_id, item_added)
                     VALUES (?, ?, ?, ?, ?, ?)'''
         try:
-            inode = self.entry_inode(parent, name, item, is_file)
-            self.inode_db.execute(insert, (inode, parent, name + (ext or ''), *values))
+            inode = self.entry_inode(db, parent, name, item, is_file)
+            db.execute(insert, (inode, parent, name + (ext or ''), *values))
         except sqlite3.IntegrityError:
             name += f' [{item.id}]'
-            inode = self.entry_inode(parent, name, item, is_file)
-            self.inode_db.execute(insert, (inode, parent, name + (ext or ''), *values))
+            inode = self.entry_inode(db, parent, name, item, is_file)
+            db.execute(insert, (inode, parent, name + (ext or ''), *values))
         return inode, name
 
-    def build_inode_table(self, mountpoint, query):
-        """creates the inodes table from the items matching query"""
-        beetfs_logger.info("Building inode tree for {}...", mountpoint)
+    def build_inode_table(self):
+        """builds a new inode table from the items matching the mount's query; blocking,
+        runs in a worker thread on a reload. Returns (database, item id -> digest of
+        the tags served for it)."""
+        beetfs_logger.info("Building inode tree for {}...", self.mountpoint)
+        # queried from the event loop thread, while a reload builds it in a worker thread
+        db = sqlite3.connect(':memory:', check_same_thread=False)
+        digests = {}
         collisions = 0
-        with self.inode_db:
+        with db:
             # item_id is NULL for a directory; album_id is kept so a directory of
             # tracks from different albums (e.g. singletons) gets no cover art.
             # The implicit rowid keeps the build order (beets' sort order), which
             # directories are listed in.
-            self.inode_db.execute('''CREATE TABLE inodes (
+            db.execute('''CREATE TABLE inodes (
                                          inode INTEGER NOT NULL UNIQUE,
                                          parent INTEGER,
                                          name TEXT,
@@ -327,31 +386,82 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                                          item_added REAL DEFAULT 0,
                                          UNIQUE (parent, name)
                                      );''')
-            self.inode_db.execute("INSERT INTO inodes (inode, parent, name) VALUES (?, 0, '')",
-                                  (ROOT_INODE, ))
+            db.execute("INSERT INTO inodes (inode, parent, name) VALUES (?, 0, '')", (ROOT_INODE, ))
             dirs = {} # (parent inode, name) -> inode
             dir_added = {ROOT_INODE: 0} # inode -> newest item_added in it
-            for item in self.library.items(query=query):
+            for item in self.library.items(query=self.query):
                 *dir_names, name = self.item_path(item)
                 parent = ROOT_INODE
                 dir_added[parent] = max(dir_added[parent], item.added)
                 for dir_name in dir_names:
                     if (parent, dir_name) not in dirs:
-                        dirs[(parent, dir_name)], _ = self.add_entry(parent, dir_name, item)
+                        dirs[(parent, dir_name)], _ = self.add_entry(db, parent, dir_name, item)
                     parent = dirs[(parent, dir_name)]
                     dir_added[parent] = max(dir_added.get(parent, 0), item.added)
-                _, served_name = self.add_entry(parent, name, item, f'.{item.format.lower()}')
+                _, served_name = self.add_entry(db, parent, name, item, f'.{item.format.lower()}')
                 if served_name != name:
                     collisions += 1
                     beetfs_logger.warning('beetfs: {} is already taken, serving item {} as {}',
                                           '/'.join(dir_names + [name]), item.id,
                                           '/'.join(dir_names + [served_name]))
-            self.inode_db.executemany('UPDATE inodes SET item_added = ? WHERE inode = ?',
-                                      [(added, inode) for inode, added in dir_added.items()])
+                digests[item.id] = tags_digest(served_tags(item))
+            db.executemany('UPDATE inodes SET item_added = ? WHERE inode = ?',
+                           [(added, inode) for inode, added in dir_added.items()])
         if collisions:
             beetfs_logger.warning('beetfs: {} items had the same path as another item; consider '
                                   'adding $disc and %aunique{{}} to the beetfs path formats', collisions)
         beetfs_logger.info("Done.")
+        return db, digests
+
+    def rebuild(self, old_db):
+        """builds a new inode table and compares it with old_db; blocking, runs in a
+        worker thread. Returns (database, digests as from build_inode_table, diff as
+        from diff_tables)."""
+        new_db, digests = self.build_inode_table()
+        return new_db, digests, diff_tables(table_entries(old_db), table_entries(new_db))
+
+    async def reload_on_sighup(self):
+        """rebuilds the tree each time the process gets SIGHUP. trio holds on to a
+        SIGHUP that arrives during a rebuild, so it leads to one more afterwards."""
+        with trio.open_signal_receiver(signal.SIGHUP) as signals:
+            async for _ in signals:
+                try:
+                    await self.reload()
+                except Exception as e: # pylint: disable=broad-exception-caught
+                    beetfs_logger.error('beetfs: reloading {} failed, still serving the old tree: {!r}',
+                                        self.mountpoint, e)
+
+    async def reload(self):
+        """rebuilds the inode table from the library and swaps it in. The mount stays,
+        so handles open on it (Samba's, a shell's working directory) stay valid, and
+        entries that didn't change keep their inodes.
+
+        Requests are served from the old table until the swap. Path formats and the
+        rest of the beets config are still the ones loaded at mount time."""
+        old_db = self.inode_db
+        new_db, digests, diff = await trio.to_thread.run_sync(self.rebuild, old_db)
+        # handlers only ever query self.inode_db and fetch all rows at once, so none
+        # still needs the old table after this
+        self.inode_db = new_db
+        old_db.close()
+        retagged = [item_id for item_id, digest in digests.items()
+                    if item_id in self.digests and self.digests[item_id] != digest]
+        self.digests = digests
+        for item_id in [i for i in self.header_info if i not in digests]:
+            del self.header_info[item_id]
+            self.header_data.pop(item_id, None)
+        for dir_inode in [i for i in self.album_art_cache if i not in diff['inodes']]:
+            del self.album_art_cache[dir_inode]
+        # so art added since shows up straight away
+        self.no_album_art.clear()
+        # the kernel caches lookups and attributes; make it ask again for what changed
+        for parent, name in diff['stale_entries']:
+            pyfuse3.invalidate_entry_async(parent, os.fsencode(name), ignore_enoent=True)
+        await self.in_thread(invalidate_inodes, sorted(
+            diff['changed_dirs'] | {ITEM_INODE_FLAG | item_id for item_id in retagged}))
+        beetfs_logger.info('beetfs: reloaded {}: {} files added, {} removed, {} moved or renamed, '
+                           '{} with changed tags', self.mountpoint, diff['added'], diff['removed'],
+                           diff['moved'], len(retagged))
 
     @staticmethod
     def art_from_file(path):
@@ -529,7 +639,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
     def source_key(item):
         """stats the source file and fingerprints the item's tags; blocking, runs in a
         worker thread. Returns (tags, stat, cache key)."""
-        tags = {k: v for k, v in item.items() if k in item._media_fields}  # pylint: disable=protected-access
+        tags = served_tags(item)
         source_stat = os.stat(item.path)
         return tags, source_stat, (source_stat.st_mtime_ns, source_stat.st_size, tags_digest(tags))
 
@@ -630,17 +740,22 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
     async def opendir(self, inode, ctx):
         """FUSE API implementation for 'open directory'"""
         beetfs_logger.debug('opendir(self, {}, {})', inode, ctx)
-        return inode
+        if not self.inode_query('SELECT 1 FROM inodes WHERE inode = ? AND item_id IS NULL', (inode, )):
+            raise pyfuse3.FUSEError(errno.ENOENT) # gone in a reload
+        # a listing takes several readdir calls, which use the row index as the
+        # offset; listing a snapshot keeps a reload in between from skipping or
+        # repeating entries
+        rows = self.inode_query('SELECT inode, name FROM inodes WHERE parent = ? ORDER BY rowid',
+                                (inode, ))
+        fh = next(self.dir_fhs)
+        self.dir_handles[fh] = (inode, rows)
+        return fh
 
-    # TODO() This does not yet do anything to preserve order or membership during a long readdir call
-    #        See: https://pyfuse3.readthedocs.io/en/latest/fuse_api.html#pyfuse3.readdir_reply
-    #        Potential fix would be some sort of mutex that allows for read-only access until all
-    #        readdir_reply calls are finished
     @fuse_handler
     async def readdir(self, fh, start_id, token):
         """FUSE API implementation for 'read directory'"""
         beetfs_logger.debug('readdir(self, {}, {}, {})', fh, start_id, token)
-        rows = self.inode_query('SELECT inode, name FROM inodes WHERE parent = ? ORDER BY rowid', (fh, ))
+        dir_inode, rows = self.dir_handles[fh]
         for idx, (inode, name) in enumerate(rows):
             if idx < start_id:
                 continue
@@ -654,10 +769,16 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                 return # token buffer full
         art_idx = len(rows)
         if start_id <= art_idx:
-            art = await self.find_album_art(fh)
+            art = await self.find_album_art(dir_inode)
             if art:
-                entry = await self.album_art_getattr(fh | ALBUM_ART_INODE_FLAG)
+                entry = await self.album_art_getattr(dir_inode | ALBUM_ART_INODE_FLAG)
                 pyfuse3.readdir_reply(token, bytes(art['name'], encoding='utf-8'), entry, art_idx + 1)
+
+    @fuse_handler
+    async def releasedir(self, fh):
+        """FUSE API implementation for 'release directory'"""
+        beetfs_logger.debug('releasedir(self, {})', fh)
+        self.dir_handles.pop(fh, None)
 
     @fuse_handler
     async def open(self, inode, flags, ctx):

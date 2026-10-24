@@ -58,7 +58,15 @@ If it fails with `Device or resource busy`, something still has a file or direct
 
 Don't stop it by killing the process: that leaves the mountpoint behind, failing with `Transport endpoint is not connected`, until it is unmounted with `fusermount3 -u` as above.
 
-The directory tree is built when the filesystem is mounted, so to see music added to beets since then, unmount and run `beet mount` again. Inode numbers come from the beets item ids and the directory paths, so they stay the same across remounts: tools that track files by inode (backup tools, NFS exports) don't see the whole library as changed.
+## Picking up library changes
+
+The directory tree is built when the filesystem is mounted. To see music imported, changed or removed in beets since then, send the mount processes `SIGHUP`:
+```
+pkill -HUP -f 'beet mount'
+```
+Each mount then rebuilds its tree in the background, keeps serving the old one meanwhile, and swaps the new one in. The mount stays in place, so music players, Samba and shells `cd`'d into it carry on without noticing, apart from seeing the changes. The log shows how many files were added, removed, moved and retagged.
+
+A reload keeps the beets config that was loaded at mount time, so after changing path formats or other settings, unmount and run `beet mount` again. Inode numbers come from the beets item ids and the directory paths, so they stay the same across reloads and remounts: tools that track files by inode (backup tools, NFS exports) don't see the whole library as changed.
 
 ## Disk usage and monitoring
 
@@ -90,6 +98,8 @@ ExecStart=/home/foo/.local/bin/beet mount
 # beet mount returns before the mounts are up; only count as started once they
 # are, so services ordered after this one see the music. One line per mountpoint
 ExecStartPost=/bin/sh -c 'until mountpoint -q /home/foo/beets/music; do sleep 1; done'
+# rebuild the trees in place to pick up library changes (see Picking up library changes)
+ExecReload=/usr/bin/pkill -HUP -f 'beet mount'
 # one line per mountpoint
 ExecStop=-/usr/bin/fusermount3 -uz /home/foo/beets/music
 Restart=on-failure
@@ -109,7 +119,7 @@ sudo systemctl enable --now beetfs
 - beetfs mounts with `allow_other`, which a non-root user may only do when `/etc/fuse.conf` contains the line `user_allow_other`.
 - `ExecStart` must use the `beet` beets is installed as (`which beet`; with pipx it is `~/.local/bin/beet`). If `library.db` or your beets config also live on the share, check those paths in `ExecStartPre` too.
 - If the share is in `/etc/fstab` (NFS, or sshfs as `fuse.sshfs` with `_netdev`), `remote-fs.target` also makes sure beetfs is unmounted before the share at shutdown. An sshfs share mounted by hand is only covered by the checks, and must be mounted with `allow_other` if another user mounted it.
-- `sudo systemctl stop beetfs` unmounts everything, `sudo systemctl restart beetfs` remounts to pick up new music, and `journalctl -u beetfs` shows the log. The stop uses `fusermount3 -uz`, so it doesn't fail on a busy mount (see [Unmounting](#unmounting)).
+- `sudo systemctl reload beetfs` picks up new music without unmounting, `sudo systemctl restart beetfs` remounts (needed after changing the beets config), `sudo systemctl stop beetfs` unmounts everything, and `journalctl -u beetfs` shows the log. The stop uses `fusermount3 -uz`, so it doesn't fail on a busy mount (see [Unmounting](#unmounting)).
 
 ### Services that use the mount
 
@@ -135,7 +145,13 @@ Run `sudo systemctl daemon-reload` after editing, if `systemctl edit` didn't alr
 
 ### Sharing the mount with Samba
 
-Samba keeps the share's directory, and whatever a client has opened in it, open for as long as the client stays connected. After `systemctl restart beetfs` those still point at the old mount, which is gone: browsing keeps working for a few seconds from caches, then Windows shows errors such as "The parameter is incorrect" or "The directory name is invalid" until it disconnects. To have Samba drop its connections to the share once the new mount is up, add this to the `[Service]` section of `beetfs.service`, below the `ExecStartPost` line that waits for the mount, with `Music` replaced by the share's name:
+Samba 4.22 and newer let clients cache folder listings until Samba tells them something changed (SMB3 directory leases). Samba doesn't notice when beetfs reloads, so Windows clients keep showing the old listing of every folder they have open until they disconnect. Turn directory leases off in the `[global]` section of `smb.conf`, so clients list a folder again after at most 10 seconds:
+```ini
+# beetfs changes the listings without Samba noticing
+smb3 directory leases = no
+```
+
+`systemctl reload beetfs` needs nothing else. A restart does: Samba keeps the share's directory, and whatever a client has opened in it, open for as long as the client stays connected. After `systemctl restart beetfs` those still point at the old mount, which is gone: browsing keeps working for a few seconds from caches, then Windows shows errors such as "The parameter is incorrect" or "The directory name is invalid" until it disconnects. To have Samba drop its connections to the share once the new mount is up, add this to the `[Service]` section of `beetfs.service`, below the `ExecStartPost` line that waits for the mount, with `Music` replaced by the share's name:
 ```ini
 # make Samba clients reconnect to the new mount; + runs it as root
 ExecStartPost=-+/usr/bin/smbcontrol smbd close-share Music
