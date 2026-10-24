@@ -60,6 +60,12 @@ Don't stop it by killing the process: that leaves the mountpoint behind, failing
 
 The directory tree is built when the filesystem is mounted, so to see music added to beets since then, unmount and run `beet mount` again. Inode numbers come from the beets item ids and the directory paths, so they stay the same across remounts: tools that track files by inode (backup tools, NFS exports) don't see the whole library as changed.
 
+## Disk usage and monitoring
+
+`df` on a mount shows the size and usage of the filesystem holding the music (beets' `directory`), so the mount only looks full when that disk really is. If the music directory can't be reached, the mount reports no blocks at all and plain `df` leaves it out.
+
+The mounts have the type `fuse.beetfs` (in `df -T`, `findmnt` and `/proc/mounts`), so monitoring that finds filesystems by itself can skip them by type. In Zabbix, add `fuse.beetfs` to the host's `{$VFS.FS.FSTYPE.NOT_MATCHES}` macro, keeping the template's default patterns in the regex, since a host macro replaces the template's value rather than adding to it.
+
 ## Starting at boot
 
 A systemd service can mount everything in `beetfs.mounts` at boot. This one waits until the music directory beets points at (here `/mnt/music`) is mounted and readable, which covers a local disk, NFS or sshfs share that comes up late or not at all: until then, the checks fail and systemd tries again every 30 seconds. Save it as `/etc/systemd/system/beetfs.service`, replacing the user `foo`, the paths and the mountpoints with yours:

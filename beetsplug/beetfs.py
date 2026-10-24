@@ -109,6 +109,11 @@ def read_source(path, offset, size):
         bfile.seek(offset)
         return bfile.read(size)
 
+def music_statvfs():
+    """the statistics of the filesystem holding the music; blocking, runs in a worker
+    thread since the music may be on NFS"""
+    return os.statvfs(config['directory'].as_filename())
+
 def directory_inode(parent, name, attempt=0):
     """the inode of directory name in parent; a later attempt gives the next candidate,
     for when that one is taken"""
@@ -206,6 +211,8 @@ class Beetfs(beetsplugin):
         path_formats = get_path_formats()
         fuse_options = set(pyfuse3.default_options)
         fuse_options.add('fsname=beetfs')
+        # shows as fuse.beetfs in /proc/mounts and df -T, so monitoring can exclude it by type
+        fuse_options.add('subtype=beetfs')
         fuse_options.add('allow_other')
         # the kernel then rejects every write (open for writing, setattr, create,
         # unlink, rename, ...) with EROFS before it reaches us
@@ -700,15 +707,19 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
     async def statfs(self, ctx):
         """FUSE API implementation for 'get filesystem statistics'"""
         beetfs_logger.debug('statfs(self, {})', ctx)
+        # pass through the numbers of the disk under the music, so the mount only
+        # looks full (and sets off monitoring) when that disk really is
         stats = pyfuse3.StatvfsData()
-        stats.f_bsize = 4096
-        stats.f_frsize = 4096
-        stats.f_blocks = 1000000
-        stats.f_bfree = 0 # read-only filesystem
-        stats.f_bavail = 0
-        stats.f_files = 1000000
-        stats.f_ffree = 0
-        stats.f_favail = 0
+        try:
+            source = await self.in_thread(music_statvfs)
+        except OSError as e:
+            # all zeros, as for a FUSE filesystem without statfs: df hides it
+            beetfs_logger.debug('beetfs: statfs of the music directory failed: {}', e)
+            return stats
+        for field in ('f_bsize', 'f_frsize', 'f_blocks', 'f_bfree', 'f_bavail',
+                      'f_files', 'f_ffree', 'f_favail'):
+            setattr(stats, field, getattr(source, field))
+        stats.f_namemax = 255
         return stats
 
     @fuse_handler

@@ -79,26 +79,3 @@ Use the podman harness:
 2. Run `beet modify -W title=...` (database only).
 3. Check that the mtime moves forward and the new title is served.
 4. Remount and check that the mtime stays the same as after step 3, and doesn't jump again.
-
-## Don't report the mount as full
-
-`statfs` reports a made-up 1,000,000 blocks with none free, and 1,000,000 inodes with none free (`f_bfree = f_bavail = f_ffree = 0`). `df` therefore shows the mount at 100% use, and so does `df -i`. Monitoring that discovers filesystems by itself (Zabbix's "Linux filesystems" discovery, also Prometheus' node_exporter, Nagios `check_disk`) raises "disk full" and "no free inodes" alerts for it.
-
-### Fix
-
-Pass the statistics of the filesystem holding the music through (`os.statvfs` of beets' `directory`, run in a worker thread since the music may be on NFS), and set only `f_namemax` ourselves. The numbers then mean something: how full the disk under the music is. The mount only alerts when that disk really is full, and that disk alerts too. mergerfs and other FUSE filesystems that sit on top of real storage do the same.
-
-- **Fallback:** if the stat fails (the share is gone), return all zeros, as a FUSE filesystem without `statfs` does. `df` hides filesystems with no blocks unless run with `-a`, and percentage checks have nothing to compute.
-- **Don't** report `f_bfree = f_blocks` (0% used) to quiet the alerts. That claims the space is free, and writes fail anyway.
-- **Mount type:** also add the mount option `subtype=beetfs`, so the type shows as `fuse.beetfs` instead of plain `fuse` in `/proc/mounts`, `df -T` and `findmnt`. Monitoring can then exclude it by type without catching every FUSE mount, e.g. Zabbix's `{$VFS.FS.FSTYPE.NOT_MATCHES}` macro on the host. Check that `findmnt -S beetfs` in the README still works: it matches the source (`fsname`), which stays the same.
-
-### Until then
-
-Exclude the mountpoints in Zabbix: add them to `{$VFS.FS.FSNAME.NOT_MATCHES}` on the host, e.g. `^(/dev|/sys|/run|/proc|.+/shm$|/home/foo/beets/.*)`. Keep the template's default patterns in the regex, because a host macro replaces the template's value instead of adding to it.
-
-### Testing statfs
-
-- `df -h` and `df -i` on the mountpoint show the same sizes and use as the music directory's filesystem.
-- `df -T` shows `fuse.beetfs`.
-- `findmnt -S beetfs` still lists the mounts.
-- With the music directory unmounted under a running beetfs, `df` (without `-a`) hides the mount instead of failing.
