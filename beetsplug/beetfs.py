@@ -49,6 +49,10 @@ COVER_FILE_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png',
 # so only their lengths are kept for every item
 HEADER_CACHE_SIZE = 32
 
+# beetfs's own record of when each item's tags changed, in the beets config
+# directory; see record_tag_changes
+TAG_STATE_FILE = 'beetfs.db'
+
 # how many directories' cover art to keep in memory
 ALBUM_ART_CACHE_SIZE = 64
 
@@ -130,24 +134,83 @@ def tags_digest(tags):
     """a compact fingerprint of an item's tags, used as part of the header cache key"""
     return hashlib.blake2b(repr(sorted(tags.items())).encode(), digest_size=16).digest()
 
+def record_tag_changes(digests, library_ids):
+    """when the served tags of each item in digests (item id -> tags_digest) last
+    changed, as item id -> time, or 0 if not since beetfs first saw the item; blocking.
+
+    beets doesn't record this when it only changes library.db (write: no), so beetfs
+    keeps each item's digest in a database of its own, beetfs.db next to the beets
+    config, and notes the time whenever a build finds a different one. It must
+    survive remounts, or every file would look changed after each one. Mounts share
+    it; the transaction is taken before reading, so they agree on the times.
+    Records of items gone from the library (not in library_ids) are dropped."""
+    os.makedirs(config.config_dir(), exist_ok=True)
+    db = sqlite3.connect(os.path.join(config.config_dir(), TAG_STATE_FILE),
+                         timeout=60, isolation_level=None)
+    try:
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('''CREATE TABLE IF NOT EXISTS tags (item_id INTEGER PRIMARY KEY,
+                                                       digest BLOB NOT NULL,
+                                                       changed REAL NOT NULL)''')
+        db.execute('BEGIN IMMEDIATE')
+        try:
+            known = {item_id: (digest, changed) for item_id, digest, changed
+                     in db.execute('SELECT item_id, digest, changed FROM tags')}
+            now = time.time()
+            changed_at, updates = {}, []
+            for item_id, digest in digests.items():
+                old = known.get(item_id)
+                if old is not None and old[0] == digest:
+                    changed_at[item_id] = old[1]
+                else:
+                    # first seen: no newer than its source file until it is edited
+                    changed_at[item_id] = 0 if old is None else now
+                    updates.append((item_id, digest, changed_at[item_id]))
+            db.executemany('INSERT OR REPLACE INTO tags VALUES (?, ?, ?)', updates)
+            db.executemany('DELETE FROM tags WHERE item_id = ?',
+                           [(item_id, ) for item_id in known if item_id not in library_ids])
+            db.execute('COMMIT')
+        except BaseException:
+            db.execute('ROLLBACK')
+            raise
+    finally:
+        db.close()
+    return changed_at
+
+def propagate_tag_changes(changed_at, item_dirs, dir_parents, dir_mtimes):
+    """makes every directory above a retagged item at least as new as its tag change,
+    as some scanners only look inside directories whose mtime changed"""
+    for item_id, changed in changed_at.items():
+        parent = item_dirs[item_id]
+        while parent is not None:
+            dir_mtimes[parent] = max(dir_mtimes[parent], changed)
+            parent = dir_parents[parent]
+
 def table_entries(db):
-    """every entry in an inode table: inode -> (parent, name, item id)"""
-    return {inode: (parent, name, item_id) for inode, parent, name, item_id
-            in db.execute('SELECT inode, parent, name, item_id FROM inodes')}
+    """every entry in an inode table: inode -> (parent, name, item id, mtime), where
+    mtime is item_added for a directory and tags_changed for a file"""
+    return {inode: (parent, name, item_id, mtime) for inode, parent, name, item_id, mtime
+            in db.execute('''SELECT inode, parent, name, item_id,
+                                    CASE WHEN item_id IS NULL THEN item_added ELSE tags_changed END
+                             FROM inodes''')}
 
 def diff_tables(old, new):
     """what changed between two inode tables, as table_entries gives them:
     stale_entries, the (parent, name) entries that are gone or now lead to another
-    inode; changed_dirs, the directories whose children changed; inodes, every inode
-    in new; and counts of files added, removed and moved."""
-    old_names = {(parent, name): inode for inode, (parent, name, _) in old.items()}
-    new_names = {(parent, name): inode for inode, (parent, name, _) in new.items()}
+    inode; changed_dirs, the directories whose children or mtime changed; retagged,
+    the files whose tags changed; inodes, every inode in new; and counts of files
+    added, removed and moved."""
+    old_names = {(entry[0], entry[1]): inode for inode, entry in old.items()}
+    new_names = {(entry[0], entry[1]): inode for inode, entry in new.items()}
     stale = [key for key, inode in old_names.items() if new_names.get(key) != inode]
     fresh = [key for key, inode in new_names.items() if old_names.get(key) != inode]
     old_files = {inode for inode, entry in old.items() if entry[2] is not None}
     new_files = {inode for inode, entry in new.items() if entry[2] is not None}
+    kept_dirs = (set(old) - old_files) & (set(new) - new_files)
     return {'stale_entries': stale,
-            'changed_dirs': {parent for parent, _ in stale + fresh if parent in new},
+            'changed_dirs': {parent for parent, _ in stale + fresh if parent in new}
+                            | {inode for inode in kept_dirs if old[inode][3] != new[inode][3]},
+            'retagged': {inode for inode in old_files & new_files if old[inode][3] != new[inode][3]},
             'inodes': set(new),
             'added': len(new_files - old_files),
             'removed': len(old_files - new_files),
@@ -290,7 +353,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         # each mount keeps its inode table in its own in-memory database so that
         # building it never touches (or write-locks) the beets library.db. A reload
         # builds a new one and swaps it in.
-        self.inode_db, self.digests = self.build_inode_table()
+        self.inode_db = self.build_inode_table()
         # open directories: fh -> (inode, rows listed), see opendir
         self.dir_handles = {}
         self.dir_fhs = itertools.count(1)
@@ -363,10 +426,21 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             db.execute(insert, (inode, parent, name + (ext or ''), *values))
         return inode, name
 
+    def tag_change_times(self, digests):
+        """record_tag_changes for digests, or all zeros (source mtimes only) if
+        beetfs.db can't be used, rather than failing the mount or reload"""
+        try:
+            with self.library.transaction() as tx:
+                library_ids = {row[0] for row in tx.query('SELECT id FROM items')}
+            return record_tag_changes(digests, library_ids)
+        except (sqlite3.Error, OSError) as e:
+            beetfs_logger.warning('beetfs: can\'t keep track of tag changes in {}, so files keep '
+                                  'their source mtimes: {}', TAG_STATE_FILE, e)
+            return dict.fromkeys(digests, 0)
+
     def build_inode_table(self):
-        """builds a new inode table from the items matching the mount's query; blocking,
-        runs in a worker thread on a reload. Returns (database, item id -> digest of
-        the tags served for it)."""
+        """builds a new inode table from the items matching the mount's query and returns
+        it; blocking, runs in a worker thread on a reload"""
         beetfs_logger.info("Building inode tree for {}...", self.mountpoint)
         # queried from the event loop thread, while a reload builds it in a worker thread
         db = sqlite3.connect(':memory:', check_same_thread=False)
@@ -375,8 +449,9 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         with db:
             # item_id is NULL for a directory; album_id is kept so a directory of
             # tracks from different albums (e.g. singletons) gets no cover art.
-            # The implicit rowid keeps the build order (beets' sort order), which
-            # directories are listed in.
+            # A directory's mtime is item_added, a file's is the later of its source
+            # file's and tags_changed. The implicit rowid keeps the build order
+            # (beets' sort order), which directories are listed in.
             db.execute('''CREATE TABLE inodes (
                                          inode INTEGER NOT NULL UNIQUE,
                                          parent INTEGER,
@@ -384,10 +459,13 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                                          item_id INTEGER,
                                          album_id INTEGER,
                                          item_added REAL DEFAULT 0,
+                                         tags_changed REAL DEFAULT 0,
                                          UNIQUE (parent, name)
                                      );''')
             db.execute("INSERT INTO inodes (inode, parent, name) VALUES (?, 0, '')", (ROOT_INODE, ))
             dirs = {} # (parent inode, name) -> inode
+            dir_parents = {ROOT_INODE: None} # inode -> parent inode
+            item_dirs = {} # item id -> inode of the directory it is in
             dir_added = {ROOT_INODE: 0} # inode -> newest item_added in it
             for item in self.library.items(query=self.query):
                 *dir_names, name = self.item_path(item)
@@ -396,6 +474,7 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                 for dir_name in dir_names:
                     if (parent, dir_name) not in dirs:
                         dirs[(parent, dir_name)], _ = self.add_entry(db, parent, dir_name, item)
+                        dir_parents[dirs[(parent, dir_name)]] = parent
                     parent = dirs[(parent, dir_name)]
                     dir_added[parent] = max(dir_added.get(parent, 0), item.added)
                 _, served_name = self.add_entry(db, parent, name, item, f'.{item.format.lower()}')
@@ -404,21 +483,26 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
                     beetfs_logger.warning('beetfs: {} is already taken, serving item {} as {}',
                                           '/'.join(dir_names + [name]), item.id,
                                           '/'.join(dir_names + [served_name]))
+                item_dirs[item.id] = parent
                 digests[item.id] = tags_digest(served_tags(item))
+            changed_at = {item_id: changed for item_id, changed
+                          in self.tag_change_times(digests).items() if changed}
+            propagate_tag_changes(changed_at, item_dirs, dir_parents, dir_added)
+            db.executemany('UPDATE inodes SET tags_changed = ? WHERE inode = ?',
+                           [(changed, ITEM_INODE_FLAG | item_id) for item_id, changed in changed_at.items()])
             db.executemany('UPDATE inodes SET item_added = ? WHERE inode = ?',
                            [(added, inode) for inode, added in dir_added.items()])
         if collisions:
             beetfs_logger.warning('beetfs: {} items had the same path as another item; consider '
                                   'adding $disc and %aunique{{}} to the beetfs path formats', collisions)
         beetfs_logger.info("Done.")
-        return db, digests
+        return db
 
     def rebuild(self, old_db):
         """builds a new inode table and compares it with old_db; blocking, runs in a
-        worker thread. Returns (database, digests as from build_inode_table, diff as
-        from diff_tables)."""
-        new_db, digests = self.build_inode_table()
-        return new_db, digests, diff_tables(table_entries(old_db), table_entries(new_db))
+        worker thread. Returns (database, diff as from diff_tables)."""
+        new_db = self.build_inode_table()
+        return new_db, diff_tables(table_entries(old_db), table_entries(new_db))
 
     async def reload_on_sighup(self):
         """rebuilds the tree each time the process gets SIGHUP. trio holds on to a
@@ -439,15 +523,12 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         Requests are served from the old table until the swap. Path formats and the
         rest of the beets config are still the ones loaded at mount time."""
         old_db = self.inode_db
-        new_db, digests, diff = await trio.to_thread.run_sync(self.rebuild, old_db)
+        new_db, diff = await trio.to_thread.run_sync(self.rebuild, old_db)
         # handlers only ever query self.inode_db and fetch all rows at once, so none
         # still needs the old table after this
         self.inode_db = new_db
         old_db.close()
-        retagged = [item_id for item_id, digest in digests.items()
-                    if item_id in self.digests and self.digests[item_id] != digest]
-        self.digests = digests
-        for item_id in [i for i in self.header_info if i not in digests]:
+        for item_id in [i for i in self.header_info if (ITEM_INODE_FLAG | i) not in diff['inodes']]:
             del self.header_info[item_id]
             self.header_data.pop(item_id, None)
         for dir_inode in [i for i in self.album_art_cache if i not in diff['inodes']]:
@@ -457,11 +538,10 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         # the kernel caches lookups and attributes; make it ask again for what changed
         for parent, name in diff['stale_entries']:
             pyfuse3.invalidate_entry_async(parent, os.fsencode(name), ignore_enoent=True)
-        await self.in_thread(invalidate_inodes, sorted(
-            diff['changed_dirs'] | {ITEM_INODE_FLAG | item_id for item_id in retagged}))
+        await self.in_thread(invalidate_inodes, sorted(diff['changed_dirs'] | diff['retagged']))
         beetfs_logger.info('beetfs: reloaded {}: {} files added, {} removed, {} moved or renamed, '
                            '{} with changed tags', self.mountpoint, diff['added'], diff['removed'],
-                           diff['moved'], len(retagged))
+                           diff['moved'], len(diff['retagged']))
 
     @staticmethod
     def art_from_file(path):
@@ -694,10 +774,11 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             return await self.album_art_getattr(inode)
         entry = pyfuse3.EntryAttributes()
         entry.st_ino = inode
-        rows = self.inode_query('SELECT item_id, item_added FROM inodes WHERE inode = ?', (inode, ))
+        rows = self.inode_query('SELECT item_id, item_added, tags_changed FROM inodes WHERE inode = ?',
+                                (inode, ))
         if not rows:
             raise pyfuse3.FUSEError(errno.ENOENT)
-        item_id, item_added = rows[0]
+        item_id, item_added, tags_changed = rows[0]
         if item_id is None: # dir
             entry.st_mode = stat.S_IFDIR | 0o555
             entry.st_nlink = 2
@@ -714,8 +795,11 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
             # the served file is the rewritten header plus the source audio
             entry.st_size = info['size']
             entry.st_atime_ns = source_stat.st_atime_ns
-            entry.st_ctime_ns = source_stat.st_ctime_ns
-            entry.st_mtime_ns = source_stat.st_mtime_ns
+            # a tag edit beets made only in library.db changes the served file too,
+            # so players and indexers that rescan by mtime pick it up
+            tags_changed_ns = int(float(tags_changed) * 1e9)
+            entry.st_ctime_ns = max(source_stat.st_ctime_ns, tags_changed_ns)
+            entry.st_mtime_ns = max(source_stat.st_mtime_ns, tags_changed_ns)
         entry.st_uid = os.getuid()
         entry.st_gid = os.getgid()
         entry.st_rdev = 0 # is this necessary?

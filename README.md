@@ -68,6 +68,12 @@ Each mount then rebuilds its tree in the background, keeps serving the old one m
 
 A reload keeps the beets config that was loaded at mount time, so after changing path formats or other settings, unmount and run `beet mount` again. Inode numbers come from the beets item ids and the directory paths, so they stay the same across reloads and remounts: tools that track files by inode (backup tools, NFS exports) don't see the whole library as changed.
 
+### File times after tag edits
+
+A file's modification time is its source file's, or the time its tags last changed in beets if that is later. So when beets only changes `library.db` (`write: no`, or music that must stay untouched), music servers and other tools that rescan files by modification time still pick up the edit, without a full rescan. The folders above the file get the newer time too.
+
+A tag change is noticed when the tree is built, so at the next reload or mount after `beet modify`. beetfs remembers each track's tags and when they last changed in `beetfs.db` next to the beets config (`~/.config/beets/beetfs.db`), so the times stay the same across remounts, and mounts share it. The first time, every file keeps its source time. If the file can't be used, beetfs logs a warning and serves the source times.
+
 ## Disk usage and monitoring
 
 `df` on a mount shows the size and usage of the filesystem holding the music (beets' `directory`), so the mount only looks full when that disk really is. If the music directory can't be reached, the mount reports no blocks at all and plain `df` leaves it out.
