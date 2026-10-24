@@ -60,11 +60,16 @@ Don't stop it by killing the process: that leaves the mountpoint behind, failing
 
 ## Picking up library changes
 
-The directory tree is built when the filesystem is mounted. To see music imported, changed or removed in beets since then, send the mount processes `SIGHUP`:
+The directory tree is built when the filesystem is mounted, and rebuilt by itself when the beets library changes: once `library.db` has been left alone for a minute, so a long `beet import` leads to one rebuild at the end rather than one per album. Music imported, changed or removed in beets therefore shows up in the mount a minute or so later. To wait a different number of seconds, or to turn this off:
+```
+beetfs:
+    auto_reload: 60     # or no
+```
+To rebuild straight away, e.g. without automatic reloading, send the mount processes `SIGHUP`:
 ```
 pkill -HUP -f 'beet mount'
 ```
-Each mount then rebuilds its tree in the background, keeps serving the old one meanwhile, and swaps the new one in. The mount stays in place, so music players, Samba and shells `cd`'d into it carry on without noticing, apart from seeing the changes. The log shows how many files were added, removed, moved and retagged.
+Each mount rebuilds its tree in the background, keeps serving the old one meanwhile, and swaps the new one in. The mount stays in place, so music players, Samba and shells `cd`'d into it carry on without noticing, apart from seeing the changes. The log shows how many files were added, removed, moved and retagged.
 
 A reload keeps the beets config that was loaded at mount time, so after changing path formats or other settings, unmount and run `beet mount` again. Inode numbers come from the beets item ids and the directory paths, so they stay the same across reloads and remounts: tools that track files by inode (backup tools, NFS exports) don't see the whole library as changed.
 
@@ -72,7 +77,7 @@ A reload keeps the beets config that was loaded at mount time, so after changing
 
 A file's modification time is its source file's, or the time its tags last changed in beets if that is later. So when beets only changes `library.db` (`write: no`, or music that must stay untouched), music servers and other tools that rescan files by modification time still pick up the edit, without a full rescan. The folders above the file get the newer time too.
 
-A tag change is noticed when the tree is built, so at the next reload or mount after `beet modify`. beetfs remembers each track's tags and when they last changed in `beetfs.db` next to the beets config (`~/.config/beets/beetfs.db`), so the times stay the same across remounts, and mounts share it. The first time, every file keeps its source time. If the file can't be used, beetfs logs a warning and serves the source times.
+A tag change is noticed when the tree is rebuilt, so about a minute after `beet modify` (see above). beetfs remembers each track's tags and when they last changed in `beetfs.db` next to the beets config (`~/.config/beets/beetfs.db`), so the times stay the same across remounts, and mounts share it. The first time, every file keeps its source time. If the file can't be used, beetfs logs a warning and serves the source times.
 
 ## Disk usage and monitoring
 
@@ -125,7 +130,7 @@ sudo systemctl enable --now beetfs
 - beetfs mounts with `allow_other`, which a non-root user may only do when `/etc/fuse.conf` contains the line `user_allow_other`.
 - `ExecStart` must use the `beet` beets is installed as (`which beet`; with pipx it is `~/.local/bin/beet`). If `library.db` or your beets config also live on the share, check those paths in `ExecStartPre` too.
 - If the share is in `/etc/fstab` (NFS, or sshfs as `fuse.sshfs` with `_netdev`), `remote-fs.target` also makes sure beetfs is unmounted before the share at shutdown. An sshfs share mounted by hand is only covered by the checks, and must be mounted with `allow_other` if another user mounted it.
-- `sudo systemctl reload beetfs` picks up new music without unmounting, `sudo systemctl restart beetfs` remounts (needed after changing the beets config), `sudo systemctl stop beetfs` unmounts everything, and `journalctl -u beetfs` shows the log. The stop uses `fusermount3 -uz`, so it doesn't fail on a busy mount (see [Unmounting](#unmounting)).
+- `sudo systemctl reload beetfs` picks up library changes straight away (they are otherwise picked up after a minute), `sudo systemctl restart beetfs` remounts (needed after changing the beets config), `sudo systemctl stop beetfs` unmounts everything, and `journalctl -u beetfs` shows the log. The stop uses `fusermount3 -uz`, so it doesn't fail on a busy mount (see [Unmounting](#unmounting)).
 
 ### Services that use the mount
 

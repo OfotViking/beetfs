@@ -49,6 +49,12 @@ COVER_FILE_NAMES = ['cover.jpg', 'cover.jpeg', 'cover.png',
 # so only their lengths are kept for every item
 HEADER_CACHE_SIZE = 32
 
+# by default, reload once library.db has been left alone for this many seconds
+AUTO_RELOAD_SECONDS = 60
+
+# how often to look whether library.db has changed, at most
+LIBRARY_POLL_SECONDS = 10
+
 # beetfs's own record of when each item's tags changed, in the beets config
 # directory; see record_tag_changes
 TAG_STATE_FILE = 'beetfs.db'
@@ -113,6 +119,19 @@ def read_source(path, offset, size):
     with open(path, 'rb') as bfile:
         bfile.seek(offset)
         return bfile.read(size)
+
+def library_signature(path):
+    """something that changes whenever beets writes to the library database at path:
+    the size and mtime of the file and of its write-ahead log, if it uses one;
+    blocking, runs in a worker thread"""
+    signature = []
+    for name in (path, path + b'-wal'):
+        try:
+            file_stat = os.stat(name)
+            signature.append((file_stat.st_mtime_ns, file_stat.st_size))
+        except OSError:
+            signature.append(None)
+    return tuple(signature)
 
 def music_statvfs():
     """the statistics of the filesystem holding the music; blocking, runs in a worker
@@ -270,10 +289,26 @@ def get_path_formats():
         raise UserError(f'{view.name} has no default path format')
     return formats + [(None, default)]
 
-async def serve(operations):
-    """serves the mount until it is unmounted, rebuilding its tree on SIGHUP"""
+def get_auto_reload():
+    """how many seconds library.db must be left alone before a mount reloads by
+    itself (beetfs.auto_reload), or 0 if it shouldn't"""
+    value = config['beetfs']['auto_reload'].get()
+    if value is True:
+        return AUTO_RELOAD_SECONDS
+    if value is False or value is None:
+        return 0
+    if isinstance(value, (int, float)) and value >= 0:
+        return value
+    raise UserError('beetfs.auto_reload must be a number of seconds, or no')
+
+async def serve(operations, auto_reload):
+    """serves the mount until it is unmounted, rebuilding its tree on SIGHUP and,
+    unless auto_reload is 0, once the library has changed and been left alone for
+    auto_reload seconds"""
     async with trio.open_nursery() as nursery:
         nursery.start_soon(operations.reload_on_sighup)
+        if auto_reload:
+            nursery.start_soon(operations.reload_on_library_change, auto_reload)
         await pyfuse3.main()
         nursery.cancel_scope.cancel()
 
@@ -284,7 +319,7 @@ class Beetfs(beetsplugin):
 
     def __init__(self):
         super().__init__()
-        self.config.add({'art_dir': None})
+        self.config.add({'art_dir': None, 'auto_reload': AUTO_RELOAD_SECONDS})
         art_dir = self.config['art_dir'].get()
         if art_dir:
             redirect_album_art(art_dir)
@@ -317,6 +352,7 @@ class Beetfs(beetsplugin):
                 return
             mountpoints[args[0]] = opts.query
         path_formats = get_path_formats()
+        auto_reload = get_auto_reload()
         fuse_options = set(pyfuse3.default_options)
         fuse_options.add('fsname=beetfs')
         # shows as fuse.beetfs in /proc/mounts and df -T, so monitoring can exclude it by type
@@ -334,7 +370,7 @@ class Beetfs(beetsplugin):
                 try:
                     beetfs_operations = Operations(lib, mount, query, path_formats)
                     pyfuse3.init(beetfs_operations, mount, fuse_options)
-                    trio.run(serve, beetfs_operations)
+                    trio.run(serve, beetfs_operations, auto_reload)
                 except Exception as e:
                     print(f'Child failed for {mount}: {e}', flush=True)
                     pyfuse3.close()
@@ -350,6 +386,11 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         self.mountpoint = mountpoint
         self.query = query
         self.path_formats = path_formats
+        self.library_path = bytestring_path(library.path)
+        # library_signature of library.db when the current tree started building,
+        # so changes made during a build lead to another reload. One reload at a time.
+        self.built_from = library_signature(self.library_path)
+        self.reload_lock = trio.Lock()
         # each mount keeps its inode table in its own in-memory database so that
         # building it never touches (or write-locks) the beets library.db. A reload
         # builds a new one and swaps it in.
@@ -509,11 +550,39 @@ class Operations(pyfuse3.Operations): # pylint: disable=too-many-instance-attrib
         SIGHUP that arrives during a rebuild, so it leads to one more afterwards."""
         with trio.open_signal_receiver(signal.SIGHUP) as signals:
             async for _ in signals:
-                try:
-                    await self.reload()
-                except Exception as e: # pylint: disable=broad-exception-caught
-                    beetfs_logger.error('beetfs: reloading {} failed, still serving the old tree: {!r}',
-                                        self.mountpoint, e)
+                await self.try_reload()
+
+    async def reload_on_library_change(self, quiet):
+        """reloads once library.db has changed and then been left alone for quiet
+        seconds, so a long beet import leads to one reload rather than one per album"""
+        seen = self.built_from
+        last_change = trio.current_time()
+        while True:
+            await trio.sleep(min(quiet, LIBRARY_POLL_SECONDS))
+            current = await self.in_thread(library_signature, self.library_path)
+            if current != seen:
+                seen, last_change = current, trio.current_time()
+            elif (current != self.built_from and not self.reload_lock.locked()
+                  and trio.current_time() - last_change >= quiet):
+                beetfs_logger.info('beetfs: the library has changed, reloading {}', self.mountpoint)
+                if not await self.try_reload():
+                    # wait for another quiet spell before trying again
+                    last_change = trio.current_time()
+
+    async def try_reload(self):
+        """reloads, one reload at a time, logging a failure instead of raising it;
+        returns whether it worked"""
+        async with self.reload_lock:
+            # taken before building, so changes made during the build aren't missed
+            signature = await self.in_thread(library_signature, self.library_path)
+            try:
+                await self.reload()
+            except Exception as e: # pylint: disable=broad-exception-caught
+                beetfs_logger.error('beetfs: reloading {} failed, still serving the old tree: {!r}',
+                                    self.mountpoint, e)
+                return False
+            self.built_from = signature
+            return True
 
     async def reload(self):
         """rebuilds the inode table from the library and swaps it in. The mount stays,
